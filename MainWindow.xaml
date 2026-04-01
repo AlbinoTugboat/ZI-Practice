@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="ZIVPO.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:ZIVPO"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Title="ZIVPO">
+
+    <Grid RowSpacing="12" Padding="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <MenuBar Grid.Row="0">
+            <MenuBarItem Title="&#x0424;&#x0430;&#x0439;&#x043B;">
+                <MenuFlyoutItem Text="&#x0412;&#x044B;&#x0445;&#x043E;&#x0434;" Click="OnFileExitClick" />
+            </MenuBarItem>
+        </MenuBar>
+
+        <StackPanel Grid.Row="1" VerticalAlignment="Center" Spacing="8">
+            <TextBlock Text="The application keeps running in the tray." FontSize="18" />
+            <TextBlock Text="Closing the window hides it to tray. Use Exit in menu or tray to stop the app." />
+        </StackPanel>
+    </Grid>
+</Window>
