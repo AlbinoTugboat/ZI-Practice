@@ -15,6 +15,8 @@ namespace winrt::ZIVPO::implementation
         App* g_appInstance = nullptr;
         constexpr wchar_t kSingleInstanceMutexPrefix[] = L"Local\\ZIVPO.SingleInstance.";
         constexpr wchar_t kAppInstancePropertyName[] = L"ZIVPO.App.Instance";
+        constexpr UINT_PTR kMainMenuFileId = 3001;
+        constexpr UINT_PTR kMainMenuExitId = 3002;
         constexpr std::wstring_view kHiddenSwitches[] = {
             L"--hidden",
             L"--background",
@@ -36,18 +38,6 @@ namespace winrt::ZIVPO::implementation
     App::App()
     {
         g_appInstance = this;
-
-        // When building without generated App.xaml glue, attach WinUI resources manually.
-        try
-        {
-            ResourceDictionary resources{};
-            resources.MergedDictionaries().Append(winrt::Microsoft::UI::Xaml::Controls::XamlControlsResources{});
-            Resources(resources);
-        }
-        catch (...)
-        {
-            TraceMessage(L"Failed to initialize WinUI application resources.");
-        }
 
         // Xaml objects should not call InitializeComponent during construction.
         // See https://github.com/microsoft/cppwinrt/tree/master/nuget#initializecomponent
@@ -122,7 +112,7 @@ namespace winrt::ZIVPO::implementation
             }
 
             m_window = Window();
-            InitializeMainWindowContent();
+            m_window.Title(L"ZIVPO");
 
             m_trayIcon = std::make_unique<::ZIVPO::TrayIconManager>();
             if (!m_trayIcon->Initialize(
@@ -157,59 +147,6 @@ namespace winrt::ZIVPO::implementation
             TraceMessage(L"OnLaunched failed with unknown exception.");
             ExitApplication();
         }
-    }
-
-    winrt::Microsoft::UI::Xaml::Markup::IXamlType App::GetXamlType(
-        [[maybe_unused]] winrt::Windows::UI::Xaml::Interop::TypeName const& type)
-    {
-        return nullptr;
-    }
-
-    winrt::Microsoft::UI::Xaml::Markup::IXamlType App::GetXamlType(
-        [[maybe_unused]] winrt::hstring const& fullName)
-    {
-        return nullptr;
-    }
-
-    winrt::com_array<winrt::Microsoft::UI::Xaml::Markup::XmlnsDefinition> App::GetXmlnsDefinitions()
-    {
-        return {};
-    }
-
-    void App::InitializeMainWindowContent()
-    {
-        namespace Controls = winrt::Microsoft::UI::Xaml::Controls;
-
-        Controls::StackPanel root{};
-        root.Padding(ThicknessHelper::FromUniformLength(12.0));
-        root.Spacing(12.0);
-
-        Controls::MenuBar menuBar{};
-        Controls::MenuBarItem fileMenu{};
-        fileMenu.Title(L"\x0424\x0430\x0439\x043B");
-
-        Controls::MenuFlyoutItem exitItem{};
-        exitItem.Text(L"\x0412\x044B\x0445\x043E\x0434");
-        exitItem.Click([this](auto&&, auto&&)
-        {
-            ExitApplication();
-        });
-
-        fileMenu.Items().Append(exitItem);
-        menuBar.Items().Append(fileMenu);
-        root.Children().Append(menuBar);
-
-        Controls::TextBlock header{};
-        header.Text(L"The application keeps running in the tray.");
-        header.FontSize(18.0);
-        root.Children().Append(header);
-
-        Controls::TextBlock details{};
-        details.Text(L"Closing the window hides it to tray. Use Exit in menu or tray to stop the app.");
-        root.Children().Append(details);
-
-        m_window.Content(root);
-        m_window.Title(L"ZIVPO");
     }
 
     bool App::AcquireSingleInstanceMutex()
@@ -292,6 +229,40 @@ namespace winrt::ZIVPO::implementation
             m_mainWindowHwnd,
             GWLP_WNDPROC,
             reinterpret_cast<LONG_PTR>(&App::MainWindowProc)));
+        EnsureMainWindowMenu();
+    }
+
+    void App::EnsureMainWindowMenu()
+    {
+        if (m_mainWindowHwnd == nullptr)
+        {
+            return;
+        }
+
+        if (GetMenu(m_mainWindowHwnd) != nullptr)
+        {
+            return;
+        }
+
+        HMENU mainMenu = CreateMenu();
+        HMENU fileSubMenu = CreatePopupMenu();
+        if (mainMenu == nullptr || fileSubMenu == nullptr)
+        {
+            if (fileSubMenu != nullptr)
+            {
+                DestroyMenu(fileSubMenu);
+            }
+            if (mainMenu != nullptr)
+            {
+                DestroyMenu(mainMenu);
+            }
+            return;
+        }
+
+        AppendMenuW(fileSubMenu, MF_STRING, kMainMenuExitId, L"\x0412\x044B\x0445\x043E\x0434");
+        AppendMenuW(mainMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(fileSubMenu), L"\x0424\x0430\x0439\x043B");
+        SetMenu(m_mainWindowHwnd, mainMenu);
+        DrawMenuBar(m_mainWindowHwnd);
     }
 
     void App::ShowMainWindow()
@@ -362,6 +333,12 @@ namespace winrt::ZIVPO::implementation
         if (message == WM_CLOSE && !m_isExiting)
         {
             HideMainWindow();
+            return 0;
+        }
+
+        if (message == WM_COMMAND && LOWORD(wParam) == kMainMenuExitId)
+        {
+            ExitApplication();
             return 0;
         }
 
