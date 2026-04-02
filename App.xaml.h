@@ -1,18 +1,22 @@
 #pragma once
 
-#include "App.xaml.g.h"
 #include "TrayIconManager.h"
 
 namespace winrt::ZIVPO::implementation
 {
     void RequestApplicationExit();
 
-    struct App : AppT<App>
+    struct App : winrt::Microsoft::UI::Xaml::ApplicationT<
+        App,
+        winrt::Microsoft::UI::Xaml::Markup::IXamlMetadataProvider>
     {
         App();
         ~App();
 
         void OnLaunched(Microsoft::UI::Xaml::LaunchActivatedEventArgs const&);
+        winrt::Microsoft::UI::Xaml::Markup::IXamlType GetXamlType(winrt::Windows::UI::Xaml::Interop::TypeName const& type);
+        winrt::Microsoft::UI::Xaml::Markup::IXamlType GetXamlType(winrt::hstring const& fullName);
+        winrt::com_array<winrt::Microsoft::UI::Xaml::Markup::XmlnsDefinition> GetXmlnsDefinitions();
 
     private:
         static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -22,6 +26,7 @@ namespace winrt::ZIVPO::implementation
         static bool ShouldStartHidden(winrt::hstring const& arguments);
         HWND MainWindowHandle() const;
         void EnsureMainWindowHooked();
+        void InitializeMainWindowContent();
         void ShowMainWindow();
         void HideMainWindow();
         void ExitApplication();
