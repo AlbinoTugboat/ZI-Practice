@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "App.xaml.h"
+#include "ServiceManager.h"
 
 #include <MddBootstrap.h>
 #include <WindowsAppSDK-VersionInfo.h>
@@ -42,6 +43,13 @@ namespace
 
 int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
+    if (ZIVPO::Service::IsServiceMode(GetCommandLineW()))
+    {
+        return ZIVPO::Service::RunServiceMode();
+    }
+
+    ZIVPO::Service::EnsureServiceRunningForGui();
+
     BootstrapGuard bootstrapGuard{};
     PACKAGE_VERSION minVersion{};
     minVersion.Version = WINDOWSAPPSDK_RUNTIME_VERSION_UINT64;

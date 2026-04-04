@@ -78,3 +78,28 @@ Workflow: `.github/workflows/build-cmake.yml`
 - Windows SDK
 - CMake 3.21+
 - NuGet CLI в `PATH` (или заранее восстановленная папка `packages`)
+
+## Service Check (PowerShell, Administrator)
+
+```powershell
+cd C:\Users\AlbinoTugboat\source\repos\ZIVPO\ZIVPO
+cmake --preset vs2026-x64
+cmake --build --preset build-debug-vs2026
+
+$exe = 'C:\Users\AlbinoTugboat\source\repos\ZIVPO\ZIVPO\out\build\vs2026-x64\Debug\ZIVPO.exe'
+$svc = 'ZIVPO.SessionLauncher'
+
+sc.exe stop $svc
+sc.exe delete $svc
+
+start-process -filepath $exe -argumentlist '--hidden'
+start-sleep -seconds 3
+
+sc.exe qc $svc
+sc.exe query $svc
+get-process ZIVPO | select-object id,processname,sessionid,starttime
+
+stop-process -name ZIVPO -force
+sc.exe stop $svc
+sc.exe delete $svc
+```

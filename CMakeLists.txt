@@ -154,6 +154,7 @@ add_custom_target(zivpo_cppwinrt_headers DEPENDS "${CPPWINRT_STAMP}")
 add_executable(zivpo WIN32
     Main.cpp
     App.xaml.cpp
+    ServiceManager.cpp
     TrayIconManager.cpp
     pch.cpp
 )
@@ -197,6 +198,8 @@ target_link_libraries(zivpo PRIVATE
     User32
     Shell32
     Advapi32
+    Userenv
+    Wtsapi32
 )
 
 add_custom_command(TARGET zivpo POST_BUILD
