@@ -15,6 +15,8 @@ namespace ZIVPO::Service
         constexpr wchar_t kServiceDisplayName[] = L"ZIVPO Session Launcher";
         constexpr wchar_t kServiceDescription[] = L"Starts ZIVPO in user sessions in hidden mode.";
         constexpr wchar_t kHiddenSwitch[] = L"--hidden";
+        constexpr wchar_t kGuiExecutableName[] = L"ZIVPO.exe";
+        constexpr wchar_t kServiceExecutableName[] = L"ZIVPO.Service.exe";
 
         SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
         SERVICE_STATUS g_serviceStatus{};
@@ -26,11 +28,6 @@ namespace ZIVPO::Service
             OutputDebugStringW(L"[ZIVPO.Service] ");
             OutputDebugStringW(message.data());
             OutputDebugStringW(L"\r\n");
-        }
-
-        bool HasSwitch(std::wstring_view commandLine, std::wstring_view value)
-        {
-            return commandLine.find(value) != std::wstring::npos;
         }
 
         std::wstring GetModulePath()
@@ -56,11 +53,40 @@ namespace ZIVPO::Service
             }
         }
 
-        std::wstring BuildServiceBinaryPath(std::wstring const& executablePath)
+        std::wstring GetDirectoryPath(std::wstring const& path)
         {
+            size_t const separator = path.find_last_of(L"\\/");
+            if (separator == std::wstring::npos)
+            {
+                return {};
+            }
+
+            return path.substr(0, separator + 1);
+        }
+
+        std::wstring BuildSiblingPath(std::wstring const& executablePath, std::wstring_view fileName)
+        {
+            std::wstring directory = GetDirectoryPath(executablePath);
+            if (directory.empty())
+            {
+                return {};
+            }
+
+            directory.append(fileName);
+            return directory;
+        }
+
+        std::wstring BuildServiceBinaryPath(std::wstring const& guiExecutablePath)
+        {
+            std::wstring servicePath = BuildSiblingPath(guiExecutablePath, kServiceExecutableName);
+            if (servicePath.empty())
+            {
+                return {};
+            }
+
             std::wstring value = L"\"";
-            value.append(executablePath);
-            value.append(L"\" --service");
+            value.append(servicePath);
+            value.push_back(L'"');
             return value;
         }
 
@@ -126,7 +152,8 @@ namespace ZIVPO::Service
                 environment = nullptr;
             }
 
-            std::wstring appPath = GetModulePath();
+            std::wstring servicePath = GetModulePath();
+            std::wstring appPath = BuildSiblingPath(servicePath, kGuiExecutableName);
             if (appPath.empty())
             {
                 if (environment != nullptr)
@@ -276,14 +303,14 @@ namespace ZIVPO::Service
             return OpenServiceW(scm, kServiceName, accessMask);
         }
 
-        void EnsureServiceAutoStart(SC_HANDLE serviceHandle)
+        void EnsureServiceConfiguration(SC_HANDLE serviceHandle, std::wstring const& binaryPath)
         {
             ChangeServiceConfigW(
                 serviceHandle,
                 SERVICE_NO_CHANGE,
                 SERVICE_AUTO_START,
                 SERVICE_NO_CHANGE,
-                nullptr,
+                binaryPath.empty() ? nullptr : binaryPath.c_str(),
                 nullptr,
                 nullptr,
                 nullptr,
@@ -294,21 +321,6 @@ namespace ZIVPO::Service
 
         SC_HANDLE CreateServiceIfMissing(SC_HANDLE scm)
         {
-            SC_HANDLE serviceHandle = OpenServiceWithAccess(
-                scm,
-                SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_CHANGE_CONFIG);
-
-            if (serviceHandle != nullptr)
-            {
-                EnsureServiceAutoStart(serviceHandle);
-                return serviceHandle;
-            }
-
-            if (GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST)
-            {
-                return nullptr;
-            }
-
             std::wstring executablePath = GetModulePath();
             if (executablePath.empty())
             {
@@ -316,6 +328,25 @@ namespace ZIVPO::Service
             }
 
             std::wstring binaryPath = BuildServiceBinaryPath(executablePath);
+            if (binaryPath.empty())
+            {
+                return nullptr;
+            }
+
+            SC_HANDLE serviceHandle = OpenServiceWithAccess(
+                scm,
+                SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_CHANGE_CONFIG);
+
+            if (serviceHandle != nullptr)
+            {
+                EnsureServiceConfiguration(serviceHandle, binaryPath);
+                return serviceHandle;
+            }
+
+            if (GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST)
+            {
+                return nullptr;
+            }
 
             serviceHandle = CreateServiceW(
                 scm,
@@ -365,12 +396,6 @@ namespace ZIVPO::Service
 
             StartServiceW(serviceHandle, 0, nullptr);
         }
-    }
-
-    bool IsServiceMode(PWSTR commandLine)
-    {
-        std::wstring_view args = commandLine != nullptr ? commandLine : L"";
-        return HasSwitch(args, L"--service") || HasSwitch(args, L"/service");
     }
 
     int RunServiceMode()

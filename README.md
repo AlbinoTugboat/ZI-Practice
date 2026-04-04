@@ -87,6 +87,7 @@ cmake --preset vs2026-x64
 cmake --build --preset build-debug-vs2026
 
 $exe = 'C:\Users\AlbinoTugboat\source\repos\ZIVPO\ZIVPO\out\build\vs2026-x64\Debug\ZIVPO.exe'
+$serviceExe = 'C:\Users\AlbinoTugboat\source\repos\ZIVPO\ZIVPO\out\build\vs2026-x64\Debug\ZIVPO.Service.exe'
 $svc = 'ZIVPO.SessionLauncher'
 
 sc.exe stop $svc
@@ -102,4 +103,49 @@ get-process ZIVPO | select-object id,processname,sessionid,starttime
 stop-process -name ZIVPO -force
 sc.exe stop $svc
 sc.exe delete $svc
+```
+
+Expected in `sc.exe qc $svc`: `BINARY_PATH_NAME` points to `...\ZIVPO.Service.exe`.
+
+## Reliable deployment (Program Files + Service)
+
+Use this flow instead of running from `C:\Users\...` build output.
+
+Build (Release):
+
+```powershell
+cmake --preset vs2026-x64
+cmake --build --preset build-release-vs2026
+```
+
+Install service and binaries (PowerShell as Administrator):
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\Install-ZIVPO.ps1 -BuildOutputDir .\out\build\vs2026-x64\Release
+```
+
+`Install-ZIVPO.ps1` also provisions Windows App Runtime MSIX packages machine-wide
+to avoid startup errors on additional users/sessions.
+
+If an existing user profile still shows Runtime version error, log in as that user
+and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Program Files\ZIVPO\Install-WindowsAppRuntime-CurrentUser.ps1
+```
+
+Check:
+
+```powershell
+sc.exe qc ZIVPO.SessionLauncher
+sc.exe query ZIVPO.SessionLauncher
+Get-Process ZIVPO | Select-Object Id,ProcessName,SessionId,StartTime
+```
+
+Uninstall:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\Uninstall-ZIVPO.ps1
 ```

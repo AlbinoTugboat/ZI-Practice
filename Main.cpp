@@ -43,11 +43,6 @@ namespace
 
 int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
-    if (ZIVPO::Service::IsServiceMode(GetCommandLineW()))
-    {
-        return ZIVPO::Service::RunServiceMode();
-    }
-
     ZIVPO::Service::EnsureServiceRunningForGui();
 
     BootstrapGuard bootstrapGuard{};

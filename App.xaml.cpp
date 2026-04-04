@@ -24,6 +24,19 @@ namespace winrt::ZIVPO::implementation
             L"/background"
         };
 
+        bool ContainsHiddenSwitch(std::wstring_view args)
+        {
+            for (auto const& token : kHiddenSwitches)
+            {
+                if (args.find(token) != std::wstring::npos)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         void TraceMessage(std::wstring_view message) noexcept
         {
             OutputDebugStringW(message.data());
@@ -175,17 +188,14 @@ namespace winrt::ZIVPO::implementation
 
     bool App::ShouldStartHidden(hstring const& arguments)
     {
-        std::wstring args = arguments.c_str();
-
-        for (auto const& token : kHiddenSwitches)
+        std::wstring activationArgs = arguments.c_str();
+        if (ContainsHiddenSwitch(activationArgs))
         {
-            if (args.find(token) != std::wstring::npos)
-            {
-                return true;
-            }
+            return true;
         }
 
-        return false;
+        std::wstring processArgs = GetCommandLineW();
+        return ContainsHiddenSwitch(processArgs);
     }
 
     HWND App::MainWindowHandle() const

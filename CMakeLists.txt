@@ -151,15 +151,7 @@ add_custom_command(
 
 add_custom_target(zivpo_cppwinrt_headers DEPENDS "${CPPWINRT_STAMP}")
 
-add_executable(zivpo WIN32
-    Main.cpp
-    App.xaml.cpp
-    ServiceManager.cpp
-    TrayIconManager.cpp
-    pch.cpp
-)
-
-target_include_directories(zivpo PRIVATE
+set(ZIVPO_COMMON_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CPPWINRT_GENERATED_DIR}"
     "${WINSDK_CPPWINRT_DIR}"
@@ -173,6 +165,16 @@ target_include_directories(zivpo PRIVATE
     "${WEBVIEW2_DIR}/build/native/include"
     "${WEBVIEW2_DIR}/build/native/include-winrt"
 )
+
+add_executable(zivpo WIN32
+    Main.cpp
+    App.xaml.cpp
+    ServiceManager.cpp
+    TrayIconManager.cpp
+    pch.cpp
+)
+
+target_include_directories(zivpo PRIVATE ${ZIVPO_COMMON_INCLUDE_DIRS})
 
 add_dependencies(zivpo zivpo_cppwinrt_headers)
 
@@ -211,4 +213,36 @@ add_custom_command(TARGET zivpo POST_BUILD
 set_target_properties(zivpo PROPERTIES
     OUTPUT_NAME "ZIVPO"
     VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:zivpo>"
+)
+
+add_executable(zivpo_service WIN32
+    ServiceMain.cpp
+    ServiceManager.cpp
+    pch.cpp
+)
+
+target_include_directories(zivpo_service PRIVATE ${ZIVPO_COMMON_INCLUDE_DIRS})
+
+add_dependencies(zivpo_service zivpo_cppwinrt_headers)
+
+target_compile_definitions(zivpo_service PRIVATE
+    UNICODE
+    _UNICODE
+)
+
+if(MSVC)
+    target_compile_options(zivpo_service PRIVATE /bigobj)
+endif()
+
+target_link_libraries(zivpo_service PRIVATE
+    Kernel32
+    User32
+    Advapi32
+    Userenv
+    Wtsapi32
+)
+
+set_target_properties(zivpo_service PROPERTIES
+    OUTPUT_NAME "ZIVPO.Service"
+    VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:zivpo_service>"
 )
