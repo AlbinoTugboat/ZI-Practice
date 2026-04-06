@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "ServiceManager.h"
 
+#include <tlhelp32.h>
 #include <userenv.h>
 #include <wtsapi32.h>
 
@@ -90,6 +91,61 @@ namespace ZIVPO::Service
             return value;
         }
 
+        bool IsExplorerRunningInSession(DWORD sessionId)
+        {
+            HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snapshot == INVALID_HANDLE_VALUE)
+            {
+                return true;
+            }
+
+            PROCESSENTRY32W processEntry{};
+            processEntry.dwSize = sizeof(processEntry);
+
+            bool found = false;
+            if (Process32FirstW(snapshot, &processEntry))
+            {
+                do
+                {
+                    if (_wcsicmp(processEntry.szExeFile, L"explorer.exe") != 0)
+                    {
+                        continue;
+                    }
+
+                    DWORD processSessionId = 0;
+                    if (!ProcessIdToSessionId(processEntry.th32ProcessID, &processSessionId))
+                    {
+                        continue;
+                    }
+
+                    if (processSessionId == sessionId)
+                    {
+                        found = true;
+                        break;
+                    }
+                } while (Process32NextW(snapshot, &processEntry));
+            }
+
+            CloseHandle(snapshot);
+            return found;
+        }
+
+        void WaitForExplorerInSession(DWORD sessionId)
+        {
+            constexpr int kMaxAttempts = 60;
+            constexpr DWORD kDelayMs = 500;
+
+            for (int attempt = 0; attempt < kMaxAttempts; ++attempt)
+            {
+                if (IsExplorerRunningInSession(sessionId))
+                {
+                    return;
+                }
+
+                Sleep(kDelayMs);
+            }
+        }
+
         void UpdateServiceStatus(DWORD state, DWORD win32ExitCode = NO_ERROR, DWORD waitHint = 0)
         {
             if (g_statusHandle == nullptr)
@@ -124,6 +180,8 @@ namespace ZIVPO::Service
 
         bool LaunchGuiHiddenInSession(DWORD sessionId)
         {
+            WaitForExplorerInSession(sessionId);
+
             HANDLE impersonationToken = nullptr;
             if (!WTSQueryUserToken(sessionId, &impersonationToken))
             {

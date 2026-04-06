@@ -100,6 +100,7 @@ set(WEBVIEW2_LIB_DIR "${WEBVIEW2_DIR}/build/native/${ZIVPO_PLATFORM_LOWER}")
 set(BOOTSTRAP_DLL "${FOUNDATION_DIR}/runtimes/win-${ZIVPO_PLATFORM_LOWER}/native/Microsoft.WindowsAppRuntime.Bootstrap.dll")
 set(CPPWINRT_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(CPPWINRT_STAMP "${CPPWINRT_GENERATED_DIR}/.stamp")
+set(ZIVPO_APP_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/app.manifest")
 
 set(INTERACTIVE_METADATA_DIR "${INTERACTIVE_DIR}/metadata")
 file(GLOB INTERACTIVE_METADATA_VERSION_DIRS LIST_DIRECTORIES true "${INTERACTIVE_DIR}/metadata/10.*")
@@ -171,6 +172,7 @@ add_executable(zivpo WIN32
     App.xaml.cpp
     ServiceManager.cpp
     TrayIconManager.cpp
+    "${ZIVPO_APP_MANIFEST}"
     pch.cpp
 )
 
@@ -186,6 +188,7 @@ target_compile_definitions(zivpo PRIVATE
 
 if(MSVC)
     target_compile_options(zivpo PRIVATE /bigobj)
+    target_link_options(zivpo PRIVATE "/MANIFESTINPUT:${ZIVPO_APP_MANIFEST}")
 endif()
 
 target_link_libraries(zivpo PRIVATE
