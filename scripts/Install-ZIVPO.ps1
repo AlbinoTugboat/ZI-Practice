@@ -42,11 +42,34 @@ function Stop-ServiceSafe {
         return
     }
 
-    if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
-        & sc.exe stop $Name | Out-Null
-        Start-Sleep -Seconds 1
-        $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(30))
+    if ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
+        return
     }
+
+    # Service Stop/Shutdown controls are intentionally disabled in app logic.
+    # Try regular stop first (for backward compatibility), then terminate by PID.
+    & sc.exe stop $Name | Out-Null
+    Start-Sleep -Seconds 1
+
+    $service.Refresh()
+    if ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
+        return
+    }
+
+    $serviceInfo = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+    if ($null -ne $serviceInfo -and $serviceInfo.ProcessId -gt 0) {
+        Stop-Process -Id $serviceInfo.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Seconds 1
+        $service.Refresh()
+        if ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
+            return
+        }
+    }
+
+    throw "Failed to stop service $Name."
 }
 
 function Add-ProvisionedMsix {
@@ -94,6 +117,10 @@ if (-not (Test-Path $guiBuildPath -PathType Leaf)) {
 
 if (-not (Test-Path $serviceBuildPath -PathType Leaf)) {
     throw "Service executable not found: $serviceBuildPath"
+}
+
+if ($null -ne (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
+    Stop-ServiceSafe -Name $ServiceName
 }
 
 New-Item -ItemType Directory -Path $resolvedInstallDir -Force | Out-Null
@@ -195,7 +222,6 @@ if ($null -eq $existingService) {
     ) | Out-Null
 }
 else {
-    Stop-ServiceSafe -Name $ServiceName
     Invoke-Sc -Args @(
         "config"
         $ServiceName

@@ -9,8 +9,10 @@
 #include <wtsapi32.h>
 
 #if defined(ZIVPO_SERVICE_HOST)
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #endif
 
@@ -331,7 +333,16 @@ namespace ZIVPO::Service
             }
         }
 
-        SC_HANDLE serviceHandle = CreateServiceIfMissing(scm);
+        // Query service state using minimal access first. A GUI process launched in a
+        // user session often has no SERVICE_START/SERVICE_CHANGE_CONFIG rights.
+        SC_HANDLE serviceHandle = OpenServiceWithAccess(scm, SERVICE_QUERY_STATUS);
+        DWORD openError = (serviceHandle == nullptr) ? GetLastError() : ERROR_SUCCESS;
+
+        if (serviceHandle == nullptr && openError == ERROR_SERVICE_DOES_NOT_EXIST)
+        {
+            serviceHandle = CreateServiceIfMissing(scm);
+        }
+
         if (serviceHandle == nullptr)
         {
             serviceHandle = OpenServiceWithAccess(scm, SERVICE_QUERY_STATUS | SERVICE_START);
@@ -343,8 +354,35 @@ namespace ZIVPO::Service
             return GuiStartupDecision::Error;
         }
 
+        bool observedStopped = false;
         bool startedByCaller = false;
-        bool running = EnsureServiceRunning(serviceHandle, startedByCaller);
+
+        SERVICE_STATUS_PROCESS status{};
+        bool running = QueryServiceStatusProcess(serviceHandle, status);
+        if (running)
+        {
+            if (status.dwCurrentState == SERVICE_RUNNING)
+            {
+                running = true;
+            }
+            else if (status.dwCurrentState == SERVICE_START_PENDING)
+            {
+                running = WaitForServiceRunning(serviceHandle, kServiceStartTimeoutMs);
+            }
+            else
+            {
+                observedStopped = true;
+                CloseServiceHandle(serviceHandle);
+                serviceHandle = OpenServiceWithAccess(scm, SERVICE_QUERY_STATUS | SERVICE_START);
+                if (serviceHandle == nullptr)
+                {
+                    CloseServiceHandle(scm);
+                    return GuiStartupDecision::Error;
+                }
+
+                running = EnsureServiceRunning(serviceHandle, startedByCaller);
+            }
+        }
 
         CloseServiceHandle(serviceHandle);
         CloseServiceHandle(scm);
@@ -354,7 +392,8 @@ namespace ZIVPO::Service
             return GuiStartupDecision::Error;
         }
 
-        if (startedByCaller)
+        // Assignment requirement: if service was stopped at startup, GUI must start it and exit.
+        if (startedByCaller || observedStopped)
         {
             return GuiStartupDecision::Exit;
         }
@@ -369,14 +408,25 @@ namespace ZIVPO::Service
 namespace
 {
     constexpr wchar_t kHiddenSwitch[] = L"--hidden";
+    constexpr int kExplorerWaitMaxAttempts = 240;
+    constexpr int kUserTokenWaitMaxAttempts = 240;
+    constexpr DWORD kRetryDelayMs = 500;
+    constexpr int kAsyncLaunchRetryAttempts = 120;
+    constexpr DWORD kAsyncLaunchRetryDelayMs = 2000;
+    constexpr DWORD kSessionMonitorIntervalMs = 5000;
 
     SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
     SERVICE_STATUS g_serviceStatus{};
     DWORD g_checkPoint = 1;
     DWORD g_serviceProcessId = 0;
     bool g_rpcStopRequested = false;
+    std::atomic<bool> g_serviceStopping{ false };
     std::mutex g_launchedProcessesMutex;
     std::unordered_map<DWORD, DWORD> g_launchedGuiProcessBySession;
+    std::mutex g_retrySessionsMutex;
+    std::unordered_set<DWORD> g_retrySessions;
+    HANDLE g_sessionMonitorStopEvent = nullptr;
+    HANDLE g_sessionMonitorThread = nullptr;
 
     bool IsProcessRunning(DWORD processId)
     {
@@ -514,6 +564,18 @@ namespace
         SetServiceStatus(g_statusHandle, &g_serviceStatus);
     }
 
+    bool AcquireRetrySlot(DWORD sessionId)
+    {
+        std::lock_guard lock(g_retrySessionsMutex);
+        return g_retrySessions.insert(sessionId).second;
+    }
+
+    void ReleaseRetrySlot(DWORD sessionId)
+    {
+        std::lock_guard lock(g_retrySessionsMutex);
+        g_retrySessions.erase(sessionId);
+    }
+
     bool IsExplorerRunningInSession(DWORD sessionId)
     {
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -555,22 +617,50 @@ namespace
 
     void WaitForExplorerInSession(DWORD sessionId)
     {
-        constexpr int kMaxAttempts = 60;
-        constexpr DWORD kDelayMs = 500;
-
-        for (int attempt = 0; attempt < kMaxAttempts; ++attempt)
+        for (int attempt = 0; attempt < kExplorerWaitMaxAttempts; ++attempt)
         {
             if (IsExplorerRunningInSession(sessionId))
             {
                 return;
             }
 
-            Sleep(kDelayMs);
+            if (g_serviceStopping.load())
+            {
+                return;
+            }
+
+            Sleep(kRetryDelayMs);
         }
+    }
+
+    HANDLE WaitForUserToken(DWORD sessionId)
+    {
+        for (int attempt = 0; attempt < kUserTokenWaitMaxAttempts; ++attempt)
+        {
+            HANDLE token = nullptr;
+            if (WTSQueryUserToken(sessionId, &token))
+            {
+                return token;
+            }
+
+            if (g_serviceStopping.load())
+            {
+                return nullptr;
+            }
+
+            Sleep(kRetryDelayMs);
+        }
+
+        return nullptr;
     }
 
     bool LaunchGuiHiddenInSession(DWORD sessionId)
     {
+        if (g_serviceStopping.load())
+        {
+            return false;
+        }
+
         if (sessionId == 0 || IsSessionGuiAlreadyRunning(sessionId))
         {
             return true;
@@ -578,8 +668,8 @@ namespace
 
         WaitForExplorerInSession(sessionId);
 
-        HANDLE impersonationToken = nullptr;
-        if (!WTSQueryUserToken(sessionId, &impersonationToken))
+        HANDLE impersonationToken = WaitForUserToken(sessionId);
+        if (impersonationToken == nullptr)
         {
             return false;
         }
@@ -661,6 +751,58 @@ namespace
         return true;
     }
 
+    DWORD WINAPI RetryLaunchThreadProc(LPVOID context)
+    {
+        DWORD sessionId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(context));
+
+        for (int attempt = 0; attempt < kAsyncLaunchRetryAttempts; ++attempt)
+        {
+            if (g_serviceStopping.load())
+            {
+                break;
+            }
+
+            if (IsSessionGuiAlreadyRunning(sessionId) || LaunchGuiHiddenInSession(sessionId))
+            {
+                break;
+            }
+
+            Sleep(kAsyncLaunchRetryDelayMs);
+        }
+
+        ReleaseRetrySlot(sessionId);
+        return 0;
+    }
+
+    void ScheduleLaunchRetry(DWORD sessionId)
+    {
+        if (sessionId == 0 || g_serviceStopping.load())
+        {
+            return;
+        }
+
+        if (!AcquireRetrySlot(sessionId))
+        {
+            return;
+        }
+
+        HANDLE retryThread = CreateThread(
+            nullptr,
+            0,
+            &RetryLaunchThreadProc,
+            reinterpret_cast<LPVOID>(static_cast<ULONG_PTR>(sessionId)),
+            0,
+            nullptr);
+
+        if (retryThread == nullptr)
+        {
+            ReleaseRetrySlot(sessionId);
+            return;
+        }
+
+        CloseHandle(retryThread);
+    }
+
     void LaunchGuiInAllActiveSessions()
     {
         PWTS_SESSION_INFOW sessions = nullptr;
@@ -681,11 +823,73 @@ namespace
 
             if (session.State == WTSActive || session.State == WTSConnected)
             {
-                LaunchGuiHiddenInSession(session.SessionId);
+                if (!LaunchGuiHiddenInSession(session.SessionId))
+                {
+                    ScheduleLaunchRetry(session.SessionId);
+                }
             }
         }
 
         WTSFreeMemory(sessions);
+    }
+
+    DWORD WINAPI SessionMonitorThreadProc([[maybe_unused]] LPVOID context)
+    {
+        while (!g_serviceStopping.load())
+        {
+            LaunchGuiInAllActiveSessions();
+
+            if (g_sessionMonitorStopEvent == nullptr)
+            {
+                Sleep(kSessionMonitorIntervalMs);
+                continue;
+            }
+
+            DWORD waitResult = WaitForSingleObject(g_sessionMonitorStopEvent, kSessionMonitorIntervalMs);
+            if (waitResult == WAIT_OBJECT_0)
+            {
+                break;
+            }
+        }
+
+        return 0;
+    }
+
+    void StartSessionMonitorThread()
+    {
+        if (g_sessionMonitorStopEvent == nullptr || g_sessionMonitorThread != nullptr)
+        {
+            return;
+        }
+
+        g_sessionMonitorThread = CreateThread(
+            nullptr,
+            0,
+            &SessionMonitorThreadProc,
+            nullptr,
+            0,
+            nullptr);
+    }
+
+    void StopSessionMonitorThread()
+    {
+        if (g_sessionMonitorStopEvent != nullptr)
+        {
+            SetEvent(g_sessionMonitorStopEvent);
+        }
+
+        if (g_sessionMonitorThread != nullptr)
+        {
+            WaitForSingleObject(g_sessionMonitorThread, 10000);
+            CloseHandle(g_sessionMonitorThread);
+            g_sessionMonitorThread = nullptr;
+        }
+
+        if (g_sessionMonitorStopEvent != nullptr)
+        {
+            CloseHandle(g_sessionMonitorStopEvent);
+            g_sessionMonitorStopEvent = nullptr;
+        }
     }
 
     RPC_STATUS StartRpcServer()
@@ -759,10 +963,14 @@ namespace
                 auto const* notification = static_cast<WTSSESSION_NOTIFICATION*>(eventData);
                 if (notification->dwSessionId != 0 &&
                     (eventType == WTS_SESSION_LOGON ||
+                     eventType == WTS_SESSION_UNLOCK ||
                      eventType == WTS_CONSOLE_CONNECT ||
                      eventType == WTS_REMOTE_CONNECT))
                 {
-                    LaunchGuiHiddenInSession(notification->dwSessionId);
+                    if (!LaunchGuiHiddenInSession(notification->dwSessionId))
+                    {
+                        ScheduleLaunchRetry(notification->dwSessionId);
+                    }
                 }
             }
             return NO_ERROR;
@@ -786,22 +994,30 @@ namespace
         g_checkPoint = 1;
         g_serviceProcessId = GetCurrentProcessId();
         g_rpcStopRequested = false;
+        g_serviceStopping = false;
+        g_sessionMonitorStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_sessionMonitorThread = nullptr;
 
         UpdateServiceStatus(SERVICE_START_PENDING, NO_ERROR, 5000);
 
         RPC_STATUS rpcStatus = StartRpcServer();
         if (rpcStatus != RPC_S_OK)
         {
+            g_serviceStopping = true;
+            StopSessionMonitorThread();
             UpdateServiceStatus(SERVICE_STOPPED, rpcStatus, 0);
             return;
         }
 
         LaunchGuiInAllActiveSessions();
         UpdateServiceStatus(SERVICE_RUNNING, NO_ERROR, 0);
+        StartSessionMonitorThread();
 
         rpcStatus = RunRpcServerLoop();
 
+        g_serviceStopping = true;
         UpdateServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
+        StopSessionMonitorThread();
         UnregisterRpcInterface();
         TerminateLaunchedGuiProcesses();
 
