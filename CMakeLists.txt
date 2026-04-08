@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(ZIVPO LANGUAGES CXX)
+project(ZIVPO LANGUAGES C CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "This project can only be built on Windows.")
@@ -93,6 +93,38 @@ if(NOT EXISTS "${WINSDK_CPPWINRT_DIR}/winrt/base.h")
     message(FATAL_ERROR "Windows SDK C++/WinRT headers were not found.")
 endif()
 
+set(WINDOWS_KITS_BIN_ROOT "C:/Program Files (x86)/Windows Kits/10/bin")
+set(WINSDK_BIN_VERSION_DIR "")
+if(DEFINED CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION AND
+   EXISTS "${WINDOWS_KITS_BIN_ROOT}/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
+    set(WINSDK_BIN_VERSION_DIR "${WINDOWS_KITS_BIN_ROOT}/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
+endif()
+if(WINSDK_BIN_VERSION_DIR STREQUAL "")
+    file(GLOB WINSDK_BIN_CANDIDATES LIST_DIRECTORIES true "${WINDOWS_KITS_BIN_ROOT}/10.*")
+    if(WINSDK_BIN_CANDIDATES)
+        list(SORT WINSDK_BIN_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
+        list(GET WINSDK_BIN_CANDIDATES 0 WINSDK_BIN_VERSION_DIR)
+    endif()
+endif()
+if(NOT EXISTS "${WINSDK_BIN_VERSION_DIR}")
+    message(FATAL_ERROR "Windows SDK bin directory was not found.")
+endif()
+
+if(ZIVPO_PLATFORM_LOWER STREQUAL "x86")
+    set(MIDL_ENV "win32")
+    set(MIDL_EXE "${WINSDK_BIN_VERSION_DIR}/x86/midl.exe")
+elseif(ZIVPO_PLATFORM_LOWER STREQUAL "arm64")
+    set(MIDL_ENV "arm64")
+    set(MIDL_EXE "${WINSDK_BIN_VERSION_DIR}/arm64/midl.exe")
+else()
+    set(MIDL_ENV "x64")
+    set(MIDL_EXE "${WINSDK_BIN_VERSION_DIR}/x64/midl.exe")
+endif()
+
+if(NOT EXISTS "${MIDL_EXE}")
+    message(FATAL_ERROR "midl.exe was not found: ${MIDL_EXE}")
+endif()
+
 set(FOUNDATION_LIB_DIR "${FOUNDATION_DIR}/lib/native/${ZIVPO_PLATFORM_LOWER}")
 set(DWRITE_LIB_DIR "${DWRITE_DIR}/lib/native/${ZIVPO_PLATFORM_LOWER}")
 set(INTERACTIVE_LIB_DIR "${INTERACTIVE_DIR}/lib/native/win10-${ZIVPO_PLATFORM_LOWER}")
@@ -101,6 +133,11 @@ set(BOOTSTRAP_DLL "${FOUNDATION_DIR}/runtimes/win-${ZIVPO_PLATFORM_LOWER}/native
 set(CPPWINRT_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(CPPWINRT_STAMP "${CPPWINRT_GENERATED_DIR}/.stamp")
 set(ZIVPO_APP_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/app.manifest")
+set(RPC_IDL_FILE "${CMAKE_CURRENT_SOURCE_DIR}/ServiceRpc.idl")
+set(RPC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/rpc")
+set(RPC_HEADER "${RPC_GENERATED_DIR}/ServiceRpc.h")
+set(RPC_CLIENT_STUB "${RPC_GENERATED_DIR}/ServiceRpcClient.c")
+set(RPC_SERVER_STUB "${RPC_GENERATED_DIR}/ServiceRpcServer.c")
 
 set(INTERACTIVE_METADATA_DIR "${INTERACTIVE_DIR}/metadata")
 file(GLOB INTERACTIVE_METADATA_VERSION_DIRS LIST_DIRECTORIES true "${INTERACTIVE_DIR}/metadata/10.*")
@@ -152,9 +189,39 @@ add_custom_command(
 
 add_custom_target(zivpo_cppwinrt_headers DEPENDS "${CPPWINRT_STAMP}")
 
+add_custom_command(
+    OUTPUT
+        "${RPC_HEADER}"
+        "${RPC_CLIENT_STUB}"
+        "${RPC_SERVER_STUB}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${RPC_GENERATED_DIR}"
+    COMMAND "${MIDL_EXE}"
+        /nologo
+        /env ${MIDL_ENV}
+        /target NT100
+        /I "${CMAKE_CURRENT_SOURCE_DIR}"
+        /header "ServiceRpc.h"
+        /cstub "ServiceRpcClient.c"
+        /sstub "ServiceRpcServer.c"
+        /client stub
+        /server stub
+        /out "${RPC_GENERATED_DIR}"
+        "${RPC_IDL_FILE}"
+    DEPENDS "${RPC_IDL_FILE}"
+    VERBATIM
+)
+
+add_custom_target(zivpo_rpc_stubs
+    DEPENDS
+        "${RPC_HEADER}"
+        "${RPC_CLIENT_STUB}"
+        "${RPC_SERVER_STUB}"
+)
+
 set(ZIVPO_COMMON_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CPPWINRT_GENERATED_DIR}"
+    "${RPC_GENERATED_DIR}"
     "${WINSDK_CPPWINRT_DIR}"
     "${WIL_DIR}/include"
     "${FOUNDATION_DIR}/include"
@@ -172,13 +239,18 @@ add_executable(zivpo WIN32
     App.xaml.cpp
     ServiceManager.cpp
     TrayIconManager.cpp
+    RpcMemory.cpp
+    "${RPC_CLIENT_STUB}"
     "${ZIVPO_APP_MANIFEST}"
     pch.cpp
 )
 
 target_include_directories(zivpo PRIVATE ${ZIVPO_COMMON_INCLUDE_DIRS})
 
-add_dependencies(zivpo zivpo_cppwinrt_headers)
+add_dependencies(zivpo
+    zivpo_cppwinrt_headers
+    zivpo_rpc_stubs
+)
 
 target_compile_definitions(zivpo PRIVATE
     UNICODE
@@ -205,6 +277,7 @@ target_link_libraries(zivpo PRIVATE
     Advapi32
     Userenv
     Wtsapi32
+    Rpcrt4
 )
 
 add_custom_command(TARGET zivpo POST_BUILD
@@ -221,16 +294,22 @@ set_target_properties(zivpo PROPERTIES
 add_executable(zivpo_service WIN32
     ServiceMain.cpp
     ServiceManager.cpp
+    RpcMemory.cpp
+    "${RPC_SERVER_STUB}"
     pch.cpp
 )
 
 target_include_directories(zivpo_service PRIVATE ${ZIVPO_COMMON_INCLUDE_DIRS})
 
-add_dependencies(zivpo_service zivpo_cppwinrt_headers)
+add_dependencies(zivpo_service
+    zivpo_cppwinrt_headers
+    zivpo_rpc_stubs
+)
 
 target_compile_definitions(zivpo_service PRIVATE
     UNICODE
     _UNICODE
+    ZIVPO_SERVICE_HOST
 )
 
 if(MSVC)
@@ -243,6 +322,7 @@ target_link_libraries(zivpo_service PRIVATE
     Advapi32
     Userenv
     Wtsapi32
+    Rpcrt4
 )
 
 set_target_properties(zivpo_service PROPERTIES

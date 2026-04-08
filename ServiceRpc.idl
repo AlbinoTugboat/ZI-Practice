@@ -1,0 +1,9 @@
+[
+    uuid(8d595bc4-df08-4c54-8e58-a7e0c8e2dd22),
+    version(1.0),
+    pointer_default(unique)
+]
+interface ZivpoServiceControl
+{
+    void RpcStopService([in] handle_t hBinding);
+}

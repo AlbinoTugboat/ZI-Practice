@@ -2,6 +2,14 @@
 
 namespace ZIVPO::Service
 {
+    enum class GuiStartupDecision
+    {
+        Continue,
+        Exit,
+        Error
+    };
+
     int RunServiceMode();
-    void EnsureServiceRunningForGui();
+    GuiStartupDecision PrepareGuiStartup();
+    bool RequestServiceStop();
 }
