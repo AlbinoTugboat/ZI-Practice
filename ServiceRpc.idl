@@ -5,5 +5,48 @@
 ]
 interface ZivpoServiceControl
 {
+    typedef struct _ZIVPO_RPC_USER_INFO
+    {
+        long authenticated;
+        wchar_t username[128];
+    } ZIVPO_RPC_USER_INFO;
+
+    typedef struct _ZIVPO_RPC_LICENSE_INFO
+    {
+        long hasLicense;
+        long licenseBlocked;
+        wchar_t expirationDate[64];
+    } ZIVPO_RPC_LICENSE_INFO;
+
+    const long ZIVPO_RPC_STATUS_OK = 0;
+    const long ZIVPO_RPC_STATUS_NOT_AUTHENTICATED = 1;
+    const long ZIVPO_RPC_STATUS_INVALID_CREDENTIALS = 2;
+    const long ZIVPO_RPC_STATUS_NO_LICENSE = 3;
+    const long ZIVPO_RPC_STATUS_ACTIVATION_FAILED = 4;
+    const long ZIVPO_RPC_STATUS_NETWORK_ERROR = 5;
+    const long ZIVPO_RPC_STATUS_INTERNAL_ERROR = 6;
+
     void RpcStopService([in] handle_t hBinding);
+
+    long RpcGetCurrentUser(
+        [in] handle_t hBinding,
+        [out] ZIVPO_RPC_USER_INFO* userInfo);
+
+    long RpcLogin(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* username,
+        [in, string] const wchar_t* password,
+        [out] ZIVPO_RPC_USER_INFO* userInfo,
+        [out] ZIVPO_RPC_LICENSE_INFO* licenseInfo);
+
+    long RpcLogout([in] handle_t hBinding);
+
+    long RpcGetLicenseInfo(
+        [in] handle_t hBinding,
+        [out] ZIVPO_RPC_LICENSE_INFO* licenseInfo);
+
+    long RpcActivateProduct(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* activationKey,
+        [out] ZIVPO_RPC_LICENSE_INFO* licenseInfo);
 }

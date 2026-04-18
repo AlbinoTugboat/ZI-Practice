@@ -4,6 +4,7 @@
 namespace
 {
     constexpr wchar_t kTrayWindowClassName[] = L"ZIVPO.TrayMessageWindow";
+    constexpr ULONGLONG kOpenInvokeDebounceMs = 250;
 
     void InvokeSafely(std::function<void()> const& callback) noexcept
     {
@@ -224,8 +225,17 @@ namespace ZIVPO
             case NIN_KEYSELECT:
             case WM_LBUTTONUP:
             case WM_LBUTTONDBLCLK:
+            {
+                ULONGLONG const now = GetTickCount64();
+                if (now - m_lastOpenInvokeTick < kOpenInvokeDebounceMs)
+                {
+                    return 0;
+                }
+
+                m_lastOpenInvokeTick = now;
                 InvokeSafely(m_onOpen);
                 return 0;
+            }
             case WM_RBUTTONUP:
             case WM_CONTEXTMENU:
                 ShowContextMenu();
@@ -239,6 +249,7 @@ namespace ZIVPO
             switch (LOWORD(wParam))
             {
             case kMenuOpenId:
+                m_lastOpenInvokeTick = GetTickCount64();
                 InvokeSafely(m_onOpen);
                 return 0;
             case kMenuExitId:

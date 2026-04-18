@@ -37,5 +37,6 @@ namespace ZIVPO
         std::function<void()> m_onExit;
         HMENU m_contextMenu{ nullptr };
         bool m_isIconAdded{ false };
+        ULONGLONG m_lastOpenInvokeTick{ 0 };
     };
 }
