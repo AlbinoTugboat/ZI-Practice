@@ -22,6 +22,9 @@ namespace winrt::ZIVPO::implementation
     {
         App* g_appInstance = nullptr;
         constexpr wchar_t kSingleInstanceMutexPrefix[] = L"Local\\ZIVPO.SingleInstance.";
+        constexpr wchar_t kAppInstancePropertyName[] = L"ZIVPO.App.Instance";
+        constexpr UINT_PTR kMainMenuFileId = 3001;
+        constexpr UINT_PTR kMainMenuExitId = 3002;
         constexpr std::wstring_view kHiddenSwitches[] = {
             L"--hidden",
             L"--background",
@@ -289,6 +292,17 @@ namespace winrt::ZIVPO::implementation
             m_windowClosedHandlerAttached = false;
         }
 
+        if (m_mainWindowHwnd != nullptr && m_originalMainWindowProc != nullptr && IsWindow(m_mainWindowHwnd))
+        {
+            SetWindowLongPtrW(
+                m_mainWindowHwnd,
+                GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(m_originalMainWindowProc));
+            RemovePropW(m_mainWindowHwnd, kAppInstancePropertyName);
+        }
+        m_mainWindowHwnd = nullptr;
+        m_originalMainWindowProc = nullptr;
+
         if (m_singleInstanceMutex != nullptr)
         {
             CloseHandle(m_singleInstanceMutex);
@@ -443,6 +457,8 @@ namespace winrt::ZIVPO::implementation
                 ResetUiElementHandles();
                 m_window = nullptr;
             }
+            m_mainWindowHwnd = nullptr;
+            m_originalMainWindowProc = nullptr;
             m_windowClosedHandlerAttached = false;
         });
         m_windowClosedHandlerAttached = true;
@@ -574,6 +590,7 @@ namespace winrt::ZIVPO::implementation
             TraceMessage(L"EnsureUiInitialized: m_window.Activate failed before BuildMainUi");
         }
         BuildMainUi();
+        EnsureMainWindowHooked();
         m_uiInitialized = true;
         TraceMessage(L"EnsureUiInitialized: completed");
     }
@@ -909,6 +926,60 @@ namespace winrt::ZIVPO::implementation
         return hwnd;
     }
 
+    void App::EnsureMainWindowHooked()
+    {
+        if (m_mainWindowHwnd != nullptr)
+        {
+            return;
+        }
+
+        m_mainWindowHwnd = MainWindowHandle();
+        if (m_mainWindowHwnd == nullptr)
+        {
+            return;
+        }
+
+        SetPropW(m_mainWindowHwnd, kAppInstancePropertyName, this);
+        m_originalMainWindowProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+            m_mainWindowHwnd,
+            GWLP_WNDPROC,
+            reinterpret_cast<LONG_PTR>(&App::MainWindowProc)));
+        EnsureMainWindowMenu();
+    }
+
+    void App::EnsureMainWindowMenu()
+    {
+        if (m_mainWindowHwnd == nullptr)
+        {
+            return;
+        }
+
+        if (GetMenu(m_mainWindowHwnd) != nullptr)
+        {
+            return;
+        }
+
+        HMENU mainMenu = CreateMenu();
+        HMENU fileSubMenu = CreatePopupMenu();
+        if (mainMenu == nullptr || fileSubMenu == nullptr)
+        {
+            if (fileSubMenu != nullptr)
+            {
+                DestroyMenu(fileSubMenu);
+            }
+            if (mainMenu != nullptr)
+            {
+                DestroyMenu(mainMenu);
+            }
+            return;
+        }
+
+        AppendMenuW(fileSubMenu, MF_STRING, kMainMenuExitId, L"\x0412\x044B\x0445\x043E\x0434");
+        AppendMenuW(mainMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(fileSubMenu), L"\x0424\x0430\x0439\x043B");
+        SetMenu(m_mainWindowHwnd, mainMenu);
+        DrawMenuBar(m_mainWindowHwnd);
+    }
+
     void App::ShowMainWindow()
     {
         TraceMessage(L"ShowMainWindow begin");
@@ -969,6 +1040,8 @@ namespace winrt::ZIVPO::implementation
             m_mainWindowVisible = false;
             return;
         }
+
+        EnsureMainWindowHooked();
 
         RECT windowRect{};
         if (GetWindowRect(hwnd, &windowRect))
@@ -1031,5 +1104,38 @@ namespace winrt::ZIVPO::implementation
     {
         ::ZIVPO::Service::RequestServiceStop();
         ExitApplication();
+    }
+
+    LRESULT CALLBACK App::MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        auto* self = reinterpret_cast<App*>(GetPropW(hwnd, kAppInstancePropertyName));
+        if (self == nullptr)
+        {
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+
+        return self->HandleMainWindowMessage(hwnd, message, wParam, lParam);
+    }
+
+    LRESULT App::HandleMainWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        if (message == WM_CLOSE && !m_isExiting)
+        {
+            HideMainWindow();
+            return 0;
+        }
+
+        if (message == WM_COMMAND && LOWORD(wParam) == kMainMenuExitId)
+        {
+            StopServiceAndExitApplication();
+            return 0;
+        }
+
+        if (m_originalMainWindowProc != nullptr)
+        {
+            return CallWindowProcW(m_originalMainWindowProc, hwnd, message, wParam, lParam);
+        }
+
+        return DefWindowProcW(hwnd, message, wParam, lParam);
     }
 }
