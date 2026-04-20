@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cwctype>
 #include <mutex>
+#include <combaseapi.h>
 #include <wincred.h>
 
 #pragma comment(lib, "Credui.lib")
@@ -210,6 +211,63 @@ namespace winrt::ZIVPO::implementation
                     ? L"Username and password are required."
                     : L"Activation key is required.";
                 return false;
+            }
+
+            return true;
+        }
+
+        bool PromptForSecureDesktopConfirmation(
+            HWND ownerWindow,
+            std::wstring_view caption,
+            std::wstring_view message,
+            hstring& errorText)
+        {
+            errorText = L"";
+
+            CREDUI_INFOW promptInfo{};
+            promptInfo.cbSize = sizeof(promptInfo);
+            promptInfo.hwndParent = ownerWindow;
+            promptInfo.pszCaptionText = caption.data();
+            promptInfo.pszMessageText = message.data();
+
+            ULONG authPackage = 0;
+            LPVOID authBuffer = nullptr;
+            ULONG authBufferSize = 0;
+            BOOL saveRequested = FALSE;
+
+            constexpr DWORD promptFlags =
+                CREDUIWIN_SECURE_PROMPT |
+                CREDUIWIN_ENUMERATE_CURRENT_USER;
+
+            DWORD const promptStatus = CredUIPromptForWindowsCredentialsW(
+                &promptInfo,
+                0,
+                &authPackage,
+                nullptr,
+                0,
+                &authBuffer,
+                &authBufferSize,
+                &saveRequested,
+                promptFlags);
+
+            if (promptStatus == ERROR_CANCELLED)
+            {
+                return false;
+            }
+
+            if (promptStatus != NO_ERROR)
+            {
+                errorText = L"Unable to open secure desktop confirmation.";
+                return false;
+            }
+
+            if (authBuffer != nullptr)
+            {
+                if (authBufferSize > 0)
+                {
+                    SecureZeroMemory(authBuffer, authBufferSize);
+                }
+                CoTaskMemFree(authBuffer);
             }
 
             return true;
@@ -652,6 +710,20 @@ namespace winrt::ZIVPO::implementation
         m_authErrorText.Text(L"");
         m_activationErrorText.Text(L"");
 
+        hstring confirmError;
+        if (!PromptForSecureDesktopConfirmation(
+            MainWindowHandle(),
+            L"ZIVPO Secure Confirmation",
+            L"Confirm log out.",
+            confirmError))
+        {
+            if (!confirmError.empty())
+            {
+                m_authErrorText.Text(confirmError);
+            }
+            return;
+        }
+
         ::ZIVPO::Service::RpcCallResult result = ::ZIVPO::Service::Logout();
         if (!result.ok)
         {
@@ -690,6 +762,20 @@ namespace winrt::ZIVPO::implementation
             if (!promptError.empty())
             {
                 m_activationErrorText.Text(promptError);
+            }
+            return;
+        }
+
+        hstring confirmError;
+        if (!PromptForSecureDesktopConfirmation(
+            MainWindowHandle(),
+            L"ZIVPO Secure Confirmation",
+            L"Confirm product activation.",
+            confirmError))
+        {
+            if (!confirmError.empty())
+            {
+                m_activationErrorText.Text(confirmError);
             }
             return;
         }
@@ -1102,6 +1188,27 @@ namespace winrt::ZIVPO::implementation
 
     void App::StopServiceAndExitApplication()
     {
+        if (!m_isExiting)
+        {
+            hstring confirmError;
+            if (!PromptForSecureDesktopConfirmation(
+                MainWindowHandle(),
+                L"ZIVPO Secure Confirmation",
+                L"Confirm application exit.",
+                confirmError))
+            {
+                if (!confirmError.empty())
+                {
+                    TraceMessage(confirmError.c_str());
+                    if (m_authErrorText != nullptr)
+                    {
+                        m_authErrorText.Text(confirmError);
+                    }
+                }
+                return;
+            }
+        }
+
         ::ZIVPO::Service::RequestServiceStop();
         ExitApplication();
     }
