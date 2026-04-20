@@ -26,12 +26,19 @@ jobs:
       - name: Build Debug (CMake)
         run: cmake --build --preset build-debug
 
+      - name: Build Release (CMake)
+        run: cmake --build --preset build-release
+
       - name: Verify expected binaries
         shell: pwsh
         run: |
           $debugDir = "out/build/vs2022-x64/Debug"
           if (-not (Test-Path "$debugDir/ZIVPO.exe")) { throw "Missing ZIVPO.exe" }
           if (-not (Test-Path "$debugDir/ZIVPO.Service.exe")) { throw "Missing ZIVPO.Service.exe" }
+
+          $releaseDir = "out/build/vs2022-x64/Release"
+          if (-not (Test-Path "$releaseDir/ZIVPO.exe")) { throw "Missing ZIVPO.exe (Release)" }
+          if (-not (Test-Path "$releaseDir/ZIVPO.Service.exe")) { throw "Missing ZIVPO.Service.exe (Release)" }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -41,3 +48,12 @@ jobs:
             out/build/vs2022-x64/Debug/ZIVPO.exe
             out/build/vs2022-x64/Debug/ZIVPO.Service.exe
             out/build/vs2022-x64/Debug/Microsoft.WindowsAppRuntime.Bootstrap.dll
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zivpo-release-vs2022-x64
+          path: |
+            out/build/vs2022-x64/Release/ZIVPO.exe
+            out/build/vs2022-x64/Release/ZIVPO.Service.exe
+            out/build/vs2022-x64/Release/Microsoft.WindowsAppRuntime.Bootstrap.dll

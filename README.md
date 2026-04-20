@@ -132,9 +132,105 @@ Expected:
 - service state is `RUNNING`
 - `ZIVPO` processes appear in user sessions (not in session 0)
 
+## Defense demo for checklist items 1 and 2
+
+Goal:
+- Item 1: GUI checks service state, starts service if stopped, waits for `RUNNING`, then GUI exits.
+- Item 2: GUI checks parent process and exits if parent is not `ZIVPO.Service.exe`.
+
+Use elevated PowerShell:
+
+```powershell
+$svc = 'ZIVPO.SessionLauncher'
+$exe = 'C:\Program Files\ZIVPO\ZIVPO.exe'
+```
+
+Step A. Confirm service is stopped:
+
+```powershell
+sc.exe query $svc
+```
+
+Expected: `STATE` is `STOPPED`.
+
+Important: service stop via `sc stop` is disabled by assignment logic.  
+Stop it from GUI menu (`File -> Exit`) or tray menu (`Exit`) before this step.
+
+Step B. Run GUI manually and show it exits:
+
+```powershell
+$manual = Start-Process -FilePath $exe -PassThru
+Start-Sleep -Seconds 2
+Get-Process -Id $manual.Id -ErrorAction SilentlyContinue
+```
+
+Expected: process with `$manual.Id` is already gone.
+
+Step C. Show service became `RUNNING` after manual GUI launch:
+
+```powershell
+1..20 | ForEach-Object {
+  $stateLine = (sc.exe query $svc | Select-String 'STATE').ToString()
+  $stateLine
+  if ($stateLine -match 'RUNNING') { break }
+  Start-Sleep -Seconds 1
+}
+```
+
+Expected: state switches to `RUNNING`.
+
+Step D. Show parent of GUI is service process:
+
+```powershell
+$servicePid = (Get-CimInstance Win32_Service -Filter "Name='$svc'").ProcessId
+$servicePid
+Get-CimInstance Win32_Process -Filter "Name='ZIVPO.exe'" |
+  Select-Object ProcessId,ParentProcessId,CommandLine
+```
+
+Expected:
+- `ParentProcessId` for `ZIVPO.exe` equals `$servicePid`
+- command line contains `--hidden`
+
 ## Uninstall
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\Uninstall-ZIVPO.ps1
 ```
+
+## Auth and License Flow (RPC + HTTPS)
+
+Service-side behavior:
+- Service keeps `accessToken`, `refreshToken`, and license state in memory only.
+- Service never writes tokens/license ticket to disk.
+- Service never returns raw tokens or raw ticket to GUI over RPC.
+- Service calls backend over HTTPS:
+  - `POST /api/auth/login`
+  - `POST /api/auth/refresh`
+  - `GET /api/user/me`
+  - `POST /api/user/licenses/check`
+  - `POST /api/user/licenses/activate`
+- Service refreshes tokens and license status in background based on expiration/lifetime.
+
+RPC methods for GUI:
+- `RpcGetCurrentUser`
+- `RpcLogin`
+- `RpcLogout`
+- `RpcGetLicenseInfo`
+- `RpcActivateProduct`
+- `RpcStopService`
+
+GUI behavior:
+- On startup GUI asks service for current user.
+- If unauthenticated: antivirus actions are blocked, login form is shown.
+- On successful login: GUI shows username and requests license.
+- If no license: antivirus actions are blocked, activation form is shown.
+- On successful activation/license: GUI shows expiration and unlocks antivirus actions.
+- GUI polls service every 15 seconds to update user/license state.
+- `Log Out` button calls RPC logout and resets GUI to unauthenticated state.
+
+Backend URL configuration:
+- Default backend URL is `https://localhost:8444`.
+- Override URL with env var `ZIVPO_API_BASE_URL`.
+- For local dev TLS, set `ZIVPO_ALLOW_INSECURE_TLS=1` if needed.

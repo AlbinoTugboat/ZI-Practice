@@ -4,6 +4,7 @@
 
 #include <MddBootstrap.h>
 #include <WindowsAppSDK-VersionInfo.h>
+#include <cwctype>
 
 namespace
 {
@@ -23,6 +24,24 @@ namespace
     bool ContainsSwitch(std::wstring_view commandLine, std::wstring_view value) noexcept
     {
         return commandLine.find(value) != std::wstring::npos;
+    }
+
+    bool IsEnvironmentFlagEnabled(wchar_t const* name) noexcept
+    {
+        wchar_t value[16]{};
+        DWORD const length = GetEnvironmentVariableW(name, value, ARRAYSIZE(value));
+        if (length == 0 || length >= ARRAYSIZE(value))
+        {
+            return false;
+        }
+
+        std::wstring normalized(value, value + length);
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](wchar_t ch)
+        {
+            return static_cast<wchar_t>(::towlower(ch));
+        });
+
+        return normalized == L"1" || normalized == L"true" || normalized == L"yes" || normalized == L"on";
     }
 
     bool IsHiddenStartupCommandLine() noexcept
@@ -113,10 +132,34 @@ namespace
             }
         }
     };
+
+    void ApplyProcessMitigations() noexcept
+    {
+        PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY extensionPointPolicy{};
+        extensionPointPolicy.DisableExtensionPoints = 1;
+        SetProcessMitigationPolicy(
+            ProcessExtensionPointDisablePolicy,
+            &extensionPointPolicy,
+            sizeof(extensionPointPolicy));
+    }
+
+    void ApplyMicrosoftSignedOnlyMitigation() noexcept
+    {
+        PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY signaturePolicy{};
+        signaturePolicy.MicrosoftSignedOnly = 1;
+        SetProcessMitigationPolicy(
+            ProcessSignaturePolicy,
+            &signaturePolicy,
+            sizeof(signaturePolicy));
+    }
 }
 
 int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
+    if (IsEnvironmentFlagEnabled(L"ZIVPO_ENABLE_EXTENSION_POINT_MITIGATION"))
+    {
+        ApplyProcessMitigations();
+    }
     bool const hiddenStartup = IsHiddenStartupCommandLine();
 
     switch (ZIVPO::Service::PrepareGuiStartup())
@@ -139,6 +182,11 @@ int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     }
 
     bootstrapGuard.initialized = true;
+
+    if (IsEnvironmentFlagEnabled(L"ZIVPO_ENABLE_MICROSOFT_DLL_ONLY"))
+    {
+        ApplyMicrosoftSignedOnlyMitigation();
+    }
 
     try
     {

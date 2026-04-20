@@ -322,6 +322,7 @@ target_link_libraries(zivpo_service PRIVATE
     Advapi32
     Userenv
     Wtsapi32
+    Winhttp
     Rpcrt4
 )
 
