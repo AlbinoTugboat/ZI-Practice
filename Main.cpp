@@ -119,7 +119,16 @@ int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
     bool const hiddenStartup = IsHiddenStartupCommandLine();
 
-    ZIVPO::Service::EnsureServiceRunningForGui();
+    switch (ZIVPO::Service::PrepareGuiStartup())
+    {
+    case ZIVPO::Service::GuiStartupDecision::Continue:
+        break;
+    case ZIVPO::Service::GuiStartupDecision::Exit:
+        return 0;
+    case ZIVPO::Service::GuiStartupDecision::Error:
+    default:
+        return FailStartup(E_FAIL, L"PrepareGuiStartup", !hiddenStartup);
+    }
 
     BootstrapGuard bootstrapGuard{};
     const HRESULT bootstrapHr = InitializeBootstrapWithRetry();

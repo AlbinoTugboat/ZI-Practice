@@ -79,33 +79,15 @@ Workflow: `.github/workflows/build-cmake.yml`
 - CMake 3.21+
 - NuGet CLI в `PATH` (или заранее восстановленная папка `packages`)
 
-## Service Check (PowerShell, Administrator)
+## Runtime architecture (current)
 
-```powershell
-cd C:\Users\AlbinoTugboat\source\repos\ZIVPO\ZIVPO
-cmake --preset vs2026-x64
-cmake --build --preset build-debug-vs2026
-
-$exe = 'C:\Users\AlbinoTugboat\source\repos\ZIVPO\ZIVPO\out\build\vs2026-x64\Debug\ZIVPO.exe'
-$serviceExe = 'C:\Users\AlbinoTugboat\source\repos\ZIVPO\ZIVPO\out\build\vs2026-x64\Debug\ZIVPO.Service.exe'
-$svc = 'ZIVPO.SessionLauncher'
-
-sc.exe stop $svc
-sc.exe delete $svc
-
-start-process -filepath $exe -argumentlist '--hidden'
-start-sleep -seconds 3
-
-sc.exe qc $svc
-sc.exe query $svc
-get-process ZIVPO | select-object id,processname,sessionid,starttime
-
-stop-process -name ZIVPO -force
-sc.exe stop $svc
-sc.exe delete $svc
-```
-
-Expected in `sc.exe qc $svc`: `BINARY_PATH_NAME` points to `...\ZIVPO.Service.exe`.
+- Two executables are produced:
+`ZIVPO.exe` (GUI process) and `ZIVPO.Service.exe` (Windows service process).
+- Service exposes local RPC endpoint over ALPC (`ncalrpc`) and accepts stop requests from GUI.
+- Service ignores SCM Stop/Shutdown controls by design (assignment requirement).
+- Service launches `ZIVPO.exe --hidden` in user sessions (except session 0), including new logons.
+- GUI startup is service-driven:
+if GUI starts service itself it exits, and if parent process is not service it exits.
 
 ## Reliable deployment (Program Files + Service)
 
@@ -118,24 +100,26 @@ cmake --preset vs2026-x64
 cmake --build --preset build-release-vs2026
 ```
 
-Install service and binaries (PowerShell as Administrator):
+Install (PowerShell as Administrator):
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\Install-ZIVPO.ps1 -BuildOutputDir .\out\build\vs2026-x64\Release
 ```
 
-`Install-ZIVPO.ps1` also provisions Windows App Runtime MSIX packages machine-wide
-to avoid startup errors on additional users/sessions.
+The installer:
+- copies binaries to `C:\Program Files\ZIVPO`
+- updates/creates service `ZIVPO.SessionLauncher`
+- provisions Windows App Runtime MSIX packages machine-wide
+- force-stops old service process when regular `sc stop` is not possible
 
-If an existing user profile still shows Runtime version error, log in as that user
-and run:
+If an existing user profile still shows Runtime version error, log in as that user and run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\Program Files\ZIVPO\Install-WindowsAppRuntime-CurrentUser.ps1
 ```
 
-Check:
+## Check commands
 
 ```powershell
 sc.exe qc ZIVPO.SessionLauncher
@@ -143,7 +127,12 @@ sc.exe query ZIVPO.SessionLauncher
 Get-Process ZIVPO | Select-Object Id,ProcessName,SessionId,StartTime
 ```
 
-Uninstall:
+Expected:
+- `BINARY_PATH_NAME` points to `...\ZIVPO.Service.exe`
+- service state is `RUNNING`
+- `ZIVPO` processes appear in user sessions (not in session 0)
+
+## Uninstall
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass

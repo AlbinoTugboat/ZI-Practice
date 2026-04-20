@@ -25,6 +25,7 @@ namespace winrt::ZIVPO::implementation
         void ShowMainWindow();
         void HideMainWindow();
         void ExitApplication();
+        void StopServiceAndExitApplication();
         friend void RequestApplicationExit();
 
         winrt::Microsoft::UI::Xaml::Window m_window{ nullptr };

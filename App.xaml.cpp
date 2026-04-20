@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "App.xaml.h"
+#include "ServiceManager.h"
 
 using namespace winrt;
 using namespace winrt::Windows::Foundation;
@@ -106,7 +107,7 @@ namespace winrt::ZIVPO::implementation
     {
         if (g_appInstance != nullptr)
         {
-            g_appInstance->ExitApplication();
+            g_appInstance->StopServiceAndExitApplication();
         }
     }
 
@@ -131,7 +132,7 @@ namespace winrt::ZIVPO::implementation
             if (!m_trayIcon->Initialize(
                 L"ZIVPO",
                 [this] { ShowMainWindow(); },
-                [this] { ExitApplication(); }))
+                [this] { StopServiceAndExitApplication(); }))
             {
                 ExitApplication();
                 return;
@@ -327,6 +328,12 @@ namespace winrt::ZIVPO::implementation
         Exit();
     }
 
+    void App::StopServiceAndExitApplication()
+    {
+        ::ZIVPO::Service::RequestServiceStop();
+        ExitApplication();
+    }
+
     LRESULT CALLBACK App::MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         auto* self = reinterpret_cast<App*>(GetPropW(hwnd, kAppInstancePropertyName));
@@ -348,7 +355,7 @@ namespace winrt::ZIVPO::implementation
 
         if (message == WM_COMMAND && LOWORD(wParam) == kMainMenuExitId)
         {
-            ExitApplication();
+            StopServiceAndExitApplication();
             return 0;
         }
 
