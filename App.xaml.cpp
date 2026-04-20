@@ -1,6 +1,5 @@
 #include "pch.h"
 #include "App.xaml.h"
-#include "MainWindow.xaml.h"
 
 using namespace winrt;
 using namespace winrt::Windows::Foundation;
@@ -16,12 +15,27 @@ namespace winrt::ZIVPO::implementation
         App* g_appInstance = nullptr;
         constexpr wchar_t kSingleInstanceMutexPrefix[] = L"Local\\ZIVPO.SingleInstance.";
         constexpr wchar_t kAppInstancePropertyName[] = L"ZIVPO.App.Instance";
+        constexpr UINT_PTR kMainMenuFileId = 3001;
+        constexpr UINT_PTR kMainMenuExitId = 3002;
         constexpr std::wstring_view kHiddenSwitches[] = {
             L"--hidden",
             L"--background",
             L"/hidden",
             L"/background"
         };
+
+        bool ContainsHiddenSwitch(std::wstring_view args)
+        {
+            for (auto const& token : kHiddenSwitches)
+            {
+                if (args.find(token) != std::wstring::npos)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
 
         void TraceMessage(std::wstring_view message) noexcept
         {
@@ -110,9 +124,8 @@ namespace winrt::ZIVPO::implementation
                 return;
             }
 
-            auto mainWindow = make<MainWindow>();
-            winrt::get_self<winrt::ZIVPO::implementation::MainWindow>(mainWindow)->InitializeUi();
-            m_window = mainWindow;
+            m_window = Window();
+            m_window.Title(L"ZIVPO");
 
             m_trayIcon = std::make_unique<::ZIVPO::TrayIconManager>();
             if (!m_trayIcon->Initialize(
@@ -175,17 +188,14 @@ namespace winrt::ZIVPO::implementation
 
     bool App::ShouldStartHidden(hstring const& arguments)
     {
-        std::wstring args = arguments.c_str();
-
-        for (auto const& token : kHiddenSwitches)
+        std::wstring activationArgs = arguments.c_str();
+        if (ContainsHiddenSwitch(activationArgs))
         {
-            if (args.find(token) != std::wstring::npos)
-            {
-                return true;
-            }
+            return true;
         }
 
-        return false;
+        std::wstring processArgs = GetCommandLineW();
+        return ContainsHiddenSwitch(processArgs);
     }
 
     HWND App::MainWindowHandle() const
@@ -229,6 +239,40 @@ namespace winrt::ZIVPO::implementation
             m_mainWindowHwnd,
             GWLP_WNDPROC,
             reinterpret_cast<LONG_PTR>(&App::MainWindowProc)));
+        EnsureMainWindowMenu();
+    }
+
+    void App::EnsureMainWindowMenu()
+    {
+        if (m_mainWindowHwnd == nullptr)
+        {
+            return;
+        }
+
+        if (GetMenu(m_mainWindowHwnd) != nullptr)
+        {
+            return;
+        }
+
+        HMENU mainMenu = CreateMenu();
+        HMENU fileSubMenu = CreatePopupMenu();
+        if (mainMenu == nullptr || fileSubMenu == nullptr)
+        {
+            if (fileSubMenu != nullptr)
+            {
+                DestroyMenu(fileSubMenu);
+            }
+            if (mainMenu != nullptr)
+            {
+                DestroyMenu(mainMenu);
+            }
+            return;
+        }
+
+        AppendMenuW(fileSubMenu, MF_STRING, kMainMenuExitId, L"\x0412\x044B\x0445\x043E\x0434");
+        AppendMenuW(mainMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(fileSubMenu), L"\x0424\x0430\x0439\x043B");
+        SetMenu(m_mainWindowHwnd, mainMenu);
+        DrawMenuBar(m_mainWindowHwnd);
     }
 
     void App::ShowMainWindow()
@@ -299,6 +343,12 @@ namespace winrt::ZIVPO::implementation
         if (message == WM_CLOSE && !m_isExiting)
         {
             HideMainWindow();
+            return 0;
+        }
+
+        if (message == WM_COMMAND && LOWORD(wParam) == kMainMenuExitId)
+        {
+            ExitApplication();
             return 0;
         }
 

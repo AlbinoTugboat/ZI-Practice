@@ -12,10 +12,12 @@
   <ItemGroup>
     <ClCompile Include="pch.cpp" />
     <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
+    <ClCompile Include="ServiceManager.cpp" />
     <ClCompile Include="TrayIconManager.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="pch.h" />
+    <ClInclude Include="ServiceManager.h" />
     <ClInclude Include="TrayIconManager.h" />
   </ItemGroup>
   <ItemGroup>

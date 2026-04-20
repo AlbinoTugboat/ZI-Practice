@@ -1,13 +1,12 @@
 #pragma once
 
-#include "App.xaml.g.h"
 #include "TrayIconManager.h"
 
 namespace winrt::ZIVPO::implementation
 {
     void RequestApplicationExit();
 
-    struct App : AppT<App>
+    struct App : winrt::Microsoft::UI::Xaml::ApplicationT<App>
     {
         App();
         ~App();
@@ -22,6 +21,7 @@ namespace winrt::ZIVPO::implementation
         static bool ShouldStartHidden(winrt::hstring const& arguments);
         HWND MainWindowHandle() const;
         void EnsureMainWindowHooked();
+        void EnsureMainWindowMenu();
         void ShowMainWindow();
         void HideMainWindow();
         void ExitApplication();
