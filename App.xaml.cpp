@@ -766,20 +766,6 @@ namespace winrt::ZIVPO::implementation
             return;
         }
 
-        hstring confirmError;
-        if (!PromptForSecureDesktopConfirmation(
-            MainWindowHandle(),
-            L"ZIVPO Secure Confirmation",
-            L"Confirm product activation.",
-            confirmError))
-        {
-            if (!confirmError.empty())
-            {
-                m_activationErrorText.Text(confirmError);
-            }
-            return;
-        }
-
         ::ZIVPO::Service::LicenseInfo licenseInfo{};
         ::ZIVPO::Service::RpcCallResult result = ::ZIVPO::Service::ActivateProduct(activationKey, licenseInfo);
         if (!result.ok)
