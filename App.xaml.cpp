@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cwctype>
 #include <mutex>
+#include <vector>
+#include <combaseapi.h>
 #include <wincred.h>
 
 #pragma comment(lib, "Credui.lib")
@@ -211,6 +213,196 @@ namespace winrt::ZIVPO::implementation
                     : L"Activation key is required.";
                 return false;
             }
+
+            return true;
+        }
+
+        bool PromptForSecureDesktopConfirmation(
+            HWND ownerWindow,
+            std::wstring_view caption,
+            std::wstring_view message,
+            hstring& errorText)
+        {
+            errorText = L"";
+
+            CREDUI_INFOW promptInfo{};
+            promptInfo.cbSize = sizeof(promptInfo);
+            promptInfo.hwndParent = ownerWindow;
+            promptInfo.pszCaptionText = caption.data();
+            promptInfo.pszMessageText = message.data();
+
+            ULONG authPackage = 0;
+            LPVOID authBuffer = nullptr;
+            ULONG authBufferSize = 0;
+            BOOL saveRequested = FALSE;
+            auto freeAuthBuffer = [&]()
+            {
+                if (authBuffer == nullptr)
+                {
+                    return;
+                }
+
+                if (authBufferSize > 0)
+                {
+                    SecureZeroMemory(authBuffer, authBufferSize);
+                }
+                CoTaskMemFree(authBuffer);
+                authBuffer = nullptr;
+                authBufferSize = 0;
+            };
+
+            constexpr DWORD promptFlags =
+                CREDUIWIN_SECURE_PROMPT |
+                CREDUIWIN_ENUMERATE_CURRENT_USER;
+
+            DWORD const promptStatus = CredUIPromptForWindowsCredentialsW(
+                &promptInfo,
+                0,
+                &authPackage,
+                nullptr,
+                0,
+                &authBuffer,
+                &authBufferSize,
+                &saveRequested,
+                promptFlags);
+
+            if (promptStatus == ERROR_CANCELLED)
+            {
+                freeAuthBuffer();
+                return false;
+            }
+
+            if (promptStatus != NO_ERROR)
+            {
+                errorText = L"Unable to open secure desktop confirmation.";
+                freeAuthBuffer();
+                return false;
+            }
+
+            DWORD userNameChars = 0;
+            DWORD domainChars = 0;
+            DWORD passwordChars = 0;
+            if (!CredUnPackAuthenticationBufferW(
+                0,
+                authBuffer,
+                authBufferSize,
+                nullptr,
+                &userNameChars,
+                nullptr,
+                &domainChars,
+                nullptr,
+                &passwordChars))
+            {
+                if (GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+                {
+                    errorText = L"Unable to parse secure desktop credentials.";
+                    freeAuthBuffer();
+                    return false;
+                }
+            }
+
+            std::vector<wchar_t> userNameBuffer(userNameChars > 0 ? userNameChars : 1, L'\0');
+            std::vector<wchar_t> domainBuffer(domainChars > 0 ? domainChars : 1, L'\0');
+            std::vector<wchar_t> passwordBuffer(passwordChars > 0 ? passwordChars : 1, L'\0');
+
+            if (!CredUnPackAuthenticationBufferW(
+                0,
+                authBuffer,
+                authBufferSize,
+                userNameBuffer.data(),
+                &userNameChars,
+                domainBuffer.data(),
+                &domainChars,
+                passwordBuffer.data(),
+                &passwordChars))
+            {
+                errorText = L"Unable to parse secure desktop credentials.";
+                SecureZeroMemory(passwordBuffer.data(), passwordBuffer.size() * sizeof(wchar_t));
+                freeAuthBuffer();
+                return false;
+            }
+
+            std::wstring userName = userNameBuffer.data();
+            std::wstring domain = domainBuffer.data();
+            std::wstring password = passwordBuffer.data();
+            SecureZeroMemory(passwordBuffer.data(), passwordBuffer.size() * sizeof(wchar_t));
+
+            if (userName.empty() || password.empty())
+            {
+                errorText = L"Windows username and password are required.";
+                if (!password.empty())
+                {
+                    SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+                }
+                freeAuthBuffer();
+                return false;
+            }
+
+            std::wstring parsedUserName = userName;
+            std::wstring parsedDomain = domain;
+            if (parsedDomain.empty())
+            {
+                wchar_t parsedUserBuffer[CREDUI_MAX_USERNAME_LENGTH + 1]{};
+                wchar_t parsedDomainBuffer[CREDUI_MAX_DOMAIN_TARGET_LENGTH + 1]{};
+                DWORD const parseStatus = CredUIParseUserNameW(
+                    userName.c_str(),
+                    parsedUserBuffer,
+                    ARRAYSIZE(parsedUserBuffer),
+                    parsedDomainBuffer,
+                    ARRAYSIZE(parsedDomainBuffer));
+                if (parseStatus == NO_ERROR)
+                {
+                    parsedUserName.assign(parsedUserBuffer);
+                    parsedDomain.assign(parsedDomainBuffer);
+                }
+            }
+
+            HANDLE userToken = nullptr;
+            auto tryLogon = [&](std::wstring const& candidateUser, std::wstring const& candidateDomain, DWORD logonType) -> bool
+            {
+                if (candidateUser.empty())
+                {
+                    return false;
+                }
+
+                HANDLE token = nullptr;
+                BOOL const ok = LogonUserW(
+                    candidateUser.c_str(),
+                    candidateDomain.empty() ? nullptr : candidateDomain.c_str(),
+                    password.c_str(),
+                    logonType,
+                    LOGON32_PROVIDER_DEFAULT,
+                    &token);
+                if (!ok)
+                {
+                    return false;
+                }
+
+                userToken = token;
+                return true;
+            };
+
+            bool logonOk =
+                tryLogon(parsedUserName, parsedDomain, LOGON32_LOGON_INTERACTIVE) ||
+                tryLogon(parsedUserName, parsedDomain, LOGON32_LOGON_NETWORK);
+
+            if (!logonOk && (parsedUserName != userName || parsedDomain != domain))
+            {
+                logonOk =
+                    tryLogon(userName, domain, LOGON32_LOGON_INTERACTIVE) ||
+                    tryLogon(userName, domain, LOGON32_LOGON_NETWORK);
+            }
+
+            SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+            freeAuthBuffer();
+
+            if (!logonOk)
+            {
+                errorText = L"Credential verification failed.";
+                return false;
+            }
+
+            CloseHandle(userToken);
 
             return true;
         }
@@ -651,6 +843,20 @@ namespace winrt::ZIVPO::implementation
     {
         m_authErrorText.Text(L"");
         m_activationErrorText.Text(L"");
+
+        hstring confirmError;
+        if (!PromptForSecureDesktopConfirmation(
+            MainWindowHandle(),
+            L"ZIVPO Secure Confirmation",
+            L"Confirm log out.",
+            confirmError))
+        {
+            if (!confirmError.empty())
+            {
+                m_authErrorText.Text(confirmError);
+            }
+            return;
+        }
 
         ::ZIVPO::Service::RpcCallResult result = ::ZIVPO::Service::Logout();
         if (!result.ok)
@@ -1102,6 +1308,27 @@ namespace winrt::ZIVPO::implementation
 
     void App::StopServiceAndExitApplication()
     {
+        if (!m_isExiting)
+        {
+            hstring confirmError;
+            if (!PromptForSecureDesktopConfirmation(
+                MainWindowHandle(),
+                L"ZIVPO Secure Confirmation",
+                L"Confirm application exit.",
+                confirmError))
+            {
+                if (!confirmError.empty())
+                {
+                    TraceMessage(confirmError.c_str());
+                    if (m_authErrorText != nullptr)
+                    {
+                        m_authErrorText.Text(confirmError);
+                    }
+                }
+                return;
+            }
+        }
+
         ::ZIVPO::Service::RequestServiceStop();
         ExitApplication();
     }

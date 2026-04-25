@@ -2,9 +2,12 @@
 #include "App.xaml.h"
 #include "ServiceManager.h"
 
+#include <Aclapi.h>
 #include <MddBootstrap.h>
 #include <WindowsAppSDK-VersionInfo.h>
+#include <array>
 #include <cwctype>
+#include <vector>
 
 namespace
 {
@@ -152,6 +155,101 @@ namespace
             &signaturePolicy,
             sizeof(signaturePolicy));
     }
+
+    bool GetCurrentUserSid(std::vector<BYTE>& sidBytes) noexcept
+    {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        {
+            return false;
+        }
+
+        DWORD required = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &required);
+        if (required == 0)
+        {
+            CloseHandle(token);
+            return false;
+        }
+
+        std::vector<BYTE> tokenInfo(required);
+        if (!GetTokenInformation(token, TokenUser, tokenInfo.data(), required, &required))
+        {
+            CloseHandle(token);
+            return false;
+        }
+        CloseHandle(token);
+
+        TOKEN_USER const* tokenUser = reinterpret_cast<TOKEN_USER const*>(tokenInfo.data());
+        DWORD sidLength = GetLengthSid(tokenUser->User.Sid);
+        if (sidLength == 0)
+        {
+            return false;
+        }
+
+        sidBytes.assign(sidLength, 0);
+        return CopySid(sidLength, sidBytes.data(), tokenUser->User.Sid) != FALSE;
+    }
+
+    bool ApplyProcessTerminationProtection() noexcept
+    {
+        std::vector<BYTE> currentUserSid;
+        if (!GetCurrentUserSid(currentUserSid))
+        {
+            return false;
+        }
+
+        std::array<BYTE, SECURITY_MAX_SID_SIZE> adminSidBuffer{};
+        std::array<BYTE, SECURITY_MAX_SID_SIZE> systemSidBuffer{};
+        DWORD adminSidSize = static_cast<DWORD>(adminSidBuffer.size());
+        DWORD systemSidSize = static_cast<DWORD>(systemSidBuffer.size());
+        if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, adminSidBuffer.data(), &adminSidSize) ||
+            !CreateWellKnownSid(WinLocalSystemSid, nullptr, systemSidBuffer.data(), &systemSidSize))
+        {
+            return false;
+        }
+
+        EXPLICIT_ACCESSW entries[3]{};
+        auto setEntry = [](EXPLICIT_ACCESSW& entry, PSID sid, DWORD permissions)
+        {
+            entry.grfAccessPermissions = permissions;
+            entry.grfAccessMode = SET_ACCESS;
+            entry.grfInheritance = NO_INHERITANCE;
+            entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            entry.Trustee.TrusteeType = TRUSTEE_IS_USER;
+            entry.Trustee.ptstrName = static_cast<LPWSTR>(sid);
+        };
+
+        setEntry(entries[0], systemSidBuffer.data(), PROCESS_ALL_ACCESS);
+        setEntry(entries[1], adminSidBuffer.data(), PROCESS_ALL_ACCESS);
+        setEntry(
+            entries[2],
+            currentUserSid.data(),
+            PROCESS_QUERY_LIMITED_INFORMATION |
+            PROCESS_SET_LIMITED_INFORMATION |
+            PROCESS_VM_READ |
+            SYNCHRONIZE |
+            READ_CONTROL);
+
+        PACL dacl = nullptr;
+        DWORD aclStatus = SetEntriesInAclW(static_cast<ULONG>(std::size(entries)), entries, nullptr, &dacl);
+        if (aclStatus != ERROR_SUCCESS)
+        {
+            return false;
+        }
+
+        DWORD securityStatus = SetSecurityInfo(
+            GetCurrentProcess(),
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr,
+            nullptr,
+            dacl,
+            nullptr);
+        LocalFree(dacl);
+
+        return securityStatus == ERROR_SUCCESS;
+    }
 }
 
 int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
@@ -186,6 +284,11 @@ int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     if (IsEnvironmentFlagEnabled(L"ZIVPO_ENABLE_MICROSOFT_DLL_ONLY"))
     {
         ApplyMicrosoftSignedOnlyMitigation();
+    }
+
+    if (!ApplyProcessTerminationProtection())
+    {
+        TraceStartupMessage(L"Failed to apply process termination protection.");
     }
 
     try

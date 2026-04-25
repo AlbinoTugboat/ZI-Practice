@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CPackWiXPatch>
+  <CPackWiXFragment Id="#PRODUCT">
+    <Condition Message="Administrator privileges are required. Run setup from an elevated Administrator session.">
+      Privileged
+    </Condition>
+
+    <CustomAction
+      Id="SetConfigureInstalledZivpoCmd"
+      Property="RunConfigureInstalledZivpoCmd"
+      Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]Configure-Installed-ZIVPO.ps1&quot; -SkipCurrentUserRuntime" />
+    <CustomAction
+      Id="RunConfigureInstalledZivpoCmd"
+      BinaryKey="WixCA"
+      DllEntry="WixQuietExec64"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+
+    <CustomAction
+      Id="SetUnconfigureInstalledZivpoCmd"
+      Property="RunUnconfigureInstalledZivpoCmd"
+      Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]Unconfigure-Installed-ZIVPO.ps1&quot;" />
+    <CustomAction
+      Id="RunUnconfigureInstalledZivpoCmd"
+      BinaryKey="WixCA"
+      DllEntry="WixQuietExec64"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="SetConfigureInstalledZivpoCmd" After="InstallFiles">NOT REMOVE~="ALL"</Custom>
+      <Custom Action="RunConfigureInstalledZivpoCmd" After="SetConfigureInstalledZivpoCmd">NOT REMOVE~="ALL"</Custom>
+
+      <Custom Action="SetUnconfigureInstalledZivpoCmd" Before="RemoveFiles">REMOVE~="ALL"</Custom>
+      <Custom Action="RunUnconfigureInstalledZivpoCmd" After="SetUnconfigureInstalledZivpoCmd">REMOVE~="ALL"</Custom>
+    </InstallExecuteSequence>
+  </CPackWiXFragment>
+</CPackWiXPatch>
