@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CPackWiXPatch>
+  <CPackWiXFragment Id="#PRODUCT">
+    <Condition Message="Administrator privileges are required. Run setup from an elevated Administrator session.">Privileged</Condition>
+  </CPackWiXFragment>
+</CPackWiXPatch>

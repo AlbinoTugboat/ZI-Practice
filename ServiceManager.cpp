@@ -4,8 +4,10 @@
 #include "ServiceRpc.h"
 
 #include <rpc.h>
+#include <bcrypt.h>
 #include <tlhelp32.h>
 #include <userenv.h>
+#include <wincrypt.h>
 #include <winhttp.h>
 #include <wtsapi32.h>
 
@@ -13,9 +15,13 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <ctime>
 #include <cwctype>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
+#include <map>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -47,6 +53,7 @@ namespace
     constexpr wchar_t kApiUserMePath[] = L"/api/user/me";
     constexpr wchar_t kApiLicenseCheckPath[] = L"/api/user/licenses/check";
     constexpr wchar_t kApiLicenseActivatePath[] = L"/api/user/licenses/activate";
+    constexpr wchar_t kApiUserSignaturesPath[] = L"/api/user/signatures";
     constexpr long long kTokenRefreshSafetyWindowSeconds = 30;
     constexpr long long kLicenseRefreshSafetyWindowSeconds = 30;
     constexpr long long kDefaultProductId = 1;
@@ -240,6 +247,10 @@ namespace
             return ZIVPO::Service::RpcStatusCode::ActivationFailed;
         case ZIVPO_RPC_STATUS_NETWORK_ERROR:
             return ZIVPO::Service::RpcStatusCode::NetworkError;
+        case ZIVPO_RPC_STATUS_INVALID_ARGUMENT:
+            return ZIVPO::Service::RpcStatusCode::InvalidArgument;
+        case ZIVPO_RPC_STATUS_SCAN_FAILED:
+            return ZIVPO::Service::RpcStatusCode::ScanFailed;
         default:
             return ZIVPO::Service::RpcStatusCode::InternalError;
         }
@@ -629,6 +640,7 @@ namespace
     constexpr int kAsyncLaunchRetryAttempts = 120;
     constexpr DWORD kAsyncLaunchRetryDelayMs = 2000;
     constexpr DWORD kSessionMonitorIntervalMs = 5000;
+    constexpr DWORD kAvBaseRefreshIntervalMs = 300000;
 
     SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
     SERVICE_STATUS g_serviceStatus{};
@@ -646,6 +658,8 @@ namespace
     HANDLE g_sessionMonitorThread = nullptr;
     HANDLE g_authWorkerStopEvent = nullptr;
     HANDLE g_authWorkerThread = nullptr;
+    HANDLE g_avWorkerStopEvent = nullptr;
+    HANDLE g_avWorkerThread = nullptr;
 
     struct ApiUrlParts
     {
@@ -669,8 +683,49 @@ namespace
         std::chrono::system_clock::time_point licenseRefreshAt{};
     };
 
+    enum class AvObjectType : long
+    {
+        Unknown = 0,
+        PeFile = 1,
+        PowerShellScript = 2
+    };
+
+    struct AvSignatureRecord
+    {
+        unsigned long long objectSignaturePrefix{ 0 };
+        unsigned long objectSignatureLength{ 0 };
+        std::vector<unsigned char> objectSignature;
+        long long offsetBegin{ 0 };
+        long long offsetEnd{ 0 };
+        AvObjectType objectType{ AvObjectType::Unknown };
+        std::vector<unsigned char> avRecordSignature;
+        std::wstring threatName;
+    };
+
+    struct AvBaseState
+    {
+        bool loaded{ false };
+        std::map<unsigned long long, std::vector<AvSignatureRecord>> recordsByPrefix;
+        std::wstring releaseDate;
+        unsigned long long recordsCount{ 0 };
+        std::chrono::system_clock::time_point loadedAt{};
+    };
+
+    struct ScanAggregateResult
+    {
+        bool completed{ false };
+        bool malicious{ false };
+        unsigned long long scannedObjects{ 0 };
+        unsigned long long infectedObjects{ 0 };
+        std::wstring targetPath;
+        std::wstring detectedThreat;
+        std::wstring details;
+    };
+
     std::mutex g_authStateMutex;
     ServiceAuthState g_authState{};
+    std::mutex g_avBaseMutex;
+    AvBaseState g_avBaseState{};
 
     void ClearAuthStateLocked(ServiceAuthState& state)
     {
@@ -705,6 +760,53 @@ namespace
         if (!state.licenseExpirationDate.empty())
         {
             StringCchCopyW(licenseInfo->expirationDate, ARRAYSIZE(licenseInfo->expirationDate), state.licenseExpirationDate.c_str());
+        }
+    }
+
+    void SetRpcAvBaseInfo(ZIVPO_RPC_AV_BASE_INFO* avBaseInfo, AvBaseState const& state)
+    {
+        if (avBaseInfo == nullptr)
+        {
+            return;
+        }
+
+        avBaseInfo->loaded = state.loaded ? 1 : 0;
+        avBaseInfo->recordsCount = static_cast<decltype(avBaseInfo->recordsCount)>(state.recordsCount);
+        avBaseInfo->releaseDate[0] = L'\0';
+        if (!state.releaseDate.empty())
+        {
+            StringCchCopyW(avBaseInfo->releaseDate, ARRAYSIZE(avBaseInfo->releaseDate), state.releaseDate.c_str());
+        }
+    }
+
+    void SetRpcScanResult(ZIVPO_RPC_SCAN_RESULT* scanResult, ScanAggregateResult const& value)
+    {
+        if (scanResult == nullptr)
+        {
+            return;
+        }
+
+        scanResult->completed = value.completed ? 1 : 0;
+        scanResult->malicious = value.malicious ? 1 : 0;
+        scanResult->scannedObjects = static_cast<decltype(scanResult->scannedObjects)>(value.scannedObjects);
+        scanResult->infectedObjects = static_cast<decltype(scanResult->infectedObjects)>(value.infectedObjects);
+        scanResult->targetPath[0] = L'\0';
+        scanResult->detectedThreat[0] = L'\0';
+        scanResult->details[0] = L'\0';
+
+        if (!value.targetPath.empty())
+        {
+            StringCchCopyW(scanResult->targetPath, ARRAYSIZE(scanResult->targetPath), value.targetPath.c_str());
+        }
+
+        if (!value.detectedThreat.empty())
+        {
+            StringCchCopyW(scanResult->detectedThreat, ARRAYSIZE(scanResult->detectedThreat), value.detectedThreat.c_str());
+        }
+
+        if (!value.details.empty())
+        {
+            StringCchCopyW(scanResult->details, ARRAYSIZE(scanResult->details), value.details.c_str());
         }
     }
 
@@ -931,6 +1033,598 @@ namespace
         WinHttpCloseHandle(connect);
         WinHttpCloseHandle(session);
         return result;
+    }
+
+    void ClearAvBaseStateLocked(AvBaseState& state)
+    {
+        state = AvBaseState{};
+    }
+
+    unsigned long long ReadPrefixAsU64(unsigned char const* bytes)
+    {
+        unsigned long long value = 0;
+        for (int i = 0; i < 8; ++i)
+        {
+            value |= (static_cast<unsigned long long>(bytes[i]) << (i * 8));
+        }
+        return value;
+    }
+
+    std::optional<std::vector<unsigned char>> DecodeHex(std::string const& hex)
+    {
+        if (hex.empty() || (hex.size() % 2) != 0)
+        {
+            return std::nullopt;
+        }
+
+        std::vector<unsigned char> bytes;
+        bytes.reserve(hex.size() / 2);
+        auto hexValue = [](char ch) -> int
+        {
+            if (ch >= '0' && ch <= '9')
+            {
+                return ch - '0';
+            }
+            if (ch >= 'a' && ch <= 'f')
+            {
+                return 10 + (ch - 'a');
+            }
+            if (ch >= 'A' && ch <= 'F')
+            {
+                return 10 + (ch - 'A');
+            }
+            return -1;
+        };
+
+        for (size_t i = 0; i < hex.size(); i += 2)
+        {
+            int const hi = hexValue(hex[i]);
+            int const lo = hexValue(hex[i + 1]);
+            if (hi < 0 || lo < 0)
+            {
+                return std::nullopt;
+            }
+            bytes.push_back(static_cast<unsigned char>((hi << 4) | lo));
+        }
+
+        return bytes;
+    }
+
+    std::optional<std::vector<unsigned char>> DecodeBase64(std::string const& base64)
+    {
+        if (base64.empty())
+        {
+            return std::vector<unsigned char>{};
+        }
+
+        DWORD binarySize = 0;
+        if (!CryptStringToBinaryA(
+            base64.c_str(),
+            static_cast<DWORD>(base64.size()),
+            CRYPT_STRING_BASE64,
+            nullptr,
+            &binarySize,
+            nullptr,
+            nullptr))
+        {
+            return std::nullopt;
+        }
+
+        std::vector<unsigned char> bytes(binarySize);
+        if (!CryptStringToBinaryA(
+            base64.c_str(),
+            static_cast<DWORD>(base64.size()),
+            CRYPT_STRING_BASE64,
+            bytes.data(),
+            &binarySize,
+            nullptr,
+            nullptr))
+        {
+            return std::nullopt;
+        }
+
+        bytes.resize(binarySize);
+        return bytes;
+    }
+
+    bool ComputeSha256(std::vector<unsigned char> const& data, std::vector<unsigned char>& hashOut)
+    {
+        hashOut.clear();
+
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+        if (status != 0)
+        {
+            return false;
+        }
+
+        DWORD hashObjectSize = 0;
+        DWORD bytesWritten = 0;
+        status = BCryptGetProperty(
+            algorithm,
+            BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&hashObjectSize),
+            sizeof(hashObjectSize),
+            &bytesWritten,
+            0);
+        if (status != 0 || hashObjectSize == 0)
+        {
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+            return false;
+        }
+
+        DWORD hashLength = 0;
+        status = BCryptGetProperty(
+            algorithm,
+            BCRYPT_HASH_LENGTH,
+            reinterpret_cast<PUCHAR>(&hashLength),
+            sizeof(hashLength),
+            &bytesWritten,
+            0);
+        if (status != 0 || hashLength == 0)
+        {
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+            return false;
+        }
+
+        std::vector<unsigned char> hashObject(hashObjectSize);
+        BCRYPT_HASH_HANDLE hashHandle = nullptr;
+        status = BCryptCreateHash(
+            algorithm,
+            &hashHandle,
+            hashObject.data(),
+            hashObjectSize,
+            nullptr,
+            0,
+            0);
+        if (status != 0)
+        {
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+            return false;
+        }
+
+        status = BCryptHashData(
+            hashHandle,
+            const_cast<PUCHAR>(data.data()),
+            static_cast<ULONG>(data.size()),
+            0);
+        if (status != 0)
+        {
+            BCryptDestroyHash(hashHandle);
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+            return false;
+        }
+
+        hashOut.resize(hashLength);
+        status = BCryptFinishHash(hashHandle, hashOut.data(), hashLength, 0);
+        BCryptDestroyHash(hashHandle);
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return status == 0;
+    }
+
+    std::vector<std::string> SplitJsonArrayObjects(std::string const& json)
+    {
+        std::vector<std::string> objects;
+        int depth = 0;
+        size_t objectStart = std::string::npos;
+        bool inString = false;
+        bool escaped = false;
+
+        for (size_t i = 0; i < json.size(); ++i)
+        {
+            char const ch = json[i];
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                    continue;
+                }
+                if (ch == '\\')
+                {
+                    escaped = true;
+                    continue;
+                }
+                if (ch == '"')
+                {
+                    inString = false;
+                }
+                continue;
+            }
+
+            if (ch == '"')
+            {
+                inString = true;
+                continue;
+            }
+
+            if (ch == '{')
+            {
+                if (depth == 0)
+                {
+                    objectStart = i;
+                }
+                ++depth;
+                continue;
+            }
+
+            if (ch == '}')
+            {
+                --depth;
+                if (depth == 0 && objectStart != std::string::npos)
+                {
+                    objects.emplace_back(json.substr(objectStart, i - objectStart + 1));
+                    objectStart = std::string::npos;
+                }
+            }
+        }
+
+        return objects;
+    }
+
+    AvObjectType ParseObjectType(std::string const& fileType)
+    {
+        std::string normalized = fileType;
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch)
+        {
+            return static_cast<char>(std::tolower(ch));
+        });
+
+        if (normalized.find("pe") != std::string::npos ||
+            normalized.find("exe") != std::string::npos ||
+            normalized.find("dll") != std::string::npos)
+        {
+            return AvObjectType::PeFile;
+        }
+
+        if (normalized.find("powershell") != std::string::npos ||
+            normalized.find("ps1") != std::string::npos)
+        {
+            return AvObjectType::PowerShellScript;
+        }
+
+        return AvObjectType::Unknown;
+    }
+
+    bool ParseSignatureRecord(std::string const& jsonObject, AvSignatureRecord& record, std::string& updatedAtIso)
+    {
+        auto firstBytesHex = ExtractJsonString(jsonObject, "firstBytesHex");
+        auto objectSignatureHex = ExtractJsonString(jsonObject, "remainderHashHex");
+        auto remainderLength = ExtractJsonInt64(jsonObject, "remainderLength");
+        auto fileType = ExtractJsonString(jsonObject, "fileType");
+        auto offsetStart = ExtractJsonInt64(jsonObject, "offsetStart");
+        auto offsetEnd = ExtractJsonInt64(jsonObject, "offsetEnd");
+        auto digitalSignatureBase64 = ExtractJsonString(jsonObject, "digitalSignatureBase64");
+        auto status = ExtractJsonString(jsonObject, "status");
+        auto threatName = ExtractJsonString(jsonObject, "threatName");
+        auto updatedAt = ExtractJsonString(jsonObject, "updatedAt");
+
+        if (!firstBytesHex.has_value() ||
+            !objectSignatureHex.has_value() ||
+            !remainderLength.has_value() ||
+            !fileType.has_value() ||
+            !offsetStart.has_value() ||
+            !offsetEnd.has_value() ||
+            !status.has_value())
+        {
+            return false;
+        }
+
+        if (*status == "DELETED")
+        {
+            return false;
+        }
+
+        std::optional<std::vector<unsigned char>> prefixBytes = DecodeHex(*firstBytesHex);
+        std::optional<std::vector<unsigned char>> objectSignature = DecodeHex(*objectSignatureHex);
+        if (!prefixBytes.has_value() || !objectSignature.has_value() || prefixBytes->size() < 8 || *remainderLength < 0)
+        {
+            return false;
+        }
+
+        record.objectSignaturePrefix = ReadPrefixAsU64(prefixBytes->data());
+        record.objectSignatureLength = static_cast<unsigned long>(8 + *remainderLength);
+        record.objectSignature = std::move(*objectSignature);
+        record.offsetBegin = *offsetStart;
+        record.offsetEnd = *offsetEnd;
+        record.objectType = ParseObjectType(*fileType);
+        record.threatName = threatName.has_value() ? Utf8ToWide(*threatName) : L"UnknownThreat";
+        if (updatedAt.has_value())
+        {
+            updatedAtIso = *updatedAt;
+        }
+
+        if (digitalSignatureBase64.has_value())
+        {
+            auto signatureBytes = DecodeBase64(*digitalSignatureBase64);
+            if (signatureBytes.has_value())
+            {
+                record.avRecordSignature = std::move(*signatureBytes);
+            }
+        }
+
+        return true;
+    }
+
+    long LoadAvBaseFromServer(ApiUrlParts const& api, std::wstring const& accessToken, AvBaseState& avBaseState)
+    {
+        HttpResult response = SendJsonRequest(api, L"GET", kApiUserSignaturesPath, "", accessToken);
+        if (!response.ok)
+        {
+            return ZIVPO_RPC_STATUS_NETWORK_ERROR;
+        }
+
+        if (response.statusCode == 401 || response.statusCode == 403)
+        {
+            return ZIVPO_RPC_STATUS_NOT_AUTHENTICATED;
+        }
+
+        if (response.statusCode == 404)
+        {
+            return ZIVPO_RPC_STATUS_NO_LICENSE;
+        }
+
+        if (response.statusCode != 200)
+        {
+            return ZIVPO_RPC_STATUS_INTERNAL_ERROR;
+        }
+
+        std::vector<std::string> jsonObjects = SplitJsonArrayObjects(response.body);
+        AvBaseState parsedState{};
+        std::string latestUpdatedAt;
+
+        for (auto const& jsonObject : jsonObjects)
+        {
+            AvSignatureRecord record{};
+            std::string updatedAt;
+            if (!ParseSignatureRecord(jsonObject, record, updatedAt))
+            {
+                continue;
+            }
+
+            parsedState.recordsByPrefix[record.objectSignaturePrefix].push_back(std::move(record));
+            ++parsedState.recordsCount;
+            if (!updatedAt.empty() && updatedAt > latestUpdatedAt)
+            {
+                latestUpdatedAt = std::move(updatedAt);
+            }
+        }
+
+        parsedState.loaded = true;
+        parsedState.loadedAt = std::chrono::system_clock::now();
+        parsedState.releaseDate = latestUpdatedAt.empty()
+            ? L"n/a"
+            : Utf8ToWide(latestUpdatedAt);
+        avBaseState = std::move(parsedState);
+        return ZIVPO_RPC_STATUS_OK;
+    }
+
+    bool ReadFileBytes(std::wstring const& filePath, std::vector<unsigned char>& bytes)
+    {
+        bytes.clear();
+        std::ifstream file(std::filesystem::path(filePath), std::ios::binary);
+        if (!file.is_open())
+        {
+            return false;
+        }
+
+        file.seekg(0, std::ios::end);
+        std::streamoff size = file.tellg();
+        if (size < 0)
+        {
+            return false;
+        }
+        file.seekg(0, std::ios::beg);
+
+        bytes.resize(static_cast<size_t>(size));
+        if (!bytes.empty())
+        {
+            file.read(reinterpret_cast<char*>(bytes.data()), size);
+            if (!file.good() && !file.eof())
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    AvObjectType DetectObjectType(std::wstring const& path, std::vector<unsigned char> const& bytes)
+    {
+        std::wstring lowerPath = path;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), [](wchar_t ch)
+        {
+            return static_cast<wchar_t>(std::towlower(ch));
+        });
+
+        if (bytes.size() >= 2 && bytes[0] == 'M' && bytes[1] == 'Z')
+        {
+            return AvObjectType::PeFile;
+        }
+
+        if (lowerPath.size() >= 4 && lowerPath.substr(lowerPath.size() - 4) == L".ps1")
+        {
+            return AvObjectType::PowerShellScript;
+        }
+
+        return AvObjectType::Unknown;
+    }
+
+    bool ScanBytesWithBase(
+        std::vector<unsigned char> const& bytes,
+        AvObjectType objectType,
+        AvBaseState const& baseState,
+        std::wstring& detectedThreat)
+    {
+        detectedThreat.clear();
+        if (bytes.size() < 8)
+        {
+            return false;
+        }
+
+        std::vector<unsigned char> signatureBytes;
+        for (size_t position = 0; position + 8 <= bytes.size(); ++position)
+        {
+            unsigned long long prefix = ReadPrefixAsU64(bytes.data() + position);
+            auto prefixIt = baseState.recordsByPrefix.find(prefix);
+            if (prefixIt == baseState.recordsByPrefix.end())
+            {
+                continue;
+            }
+
+            auto const& records = prefixIt->second;
+            for (auto const& record : records)
+            {
+                if (record.objectType != AvObjectType::Unknown && record.objectType != objectType)
+                {
+                    continue;
+                }
+
+                long long const currentOffset = static_cast<long long>(position);
+                if (currentOffset < record.offsetBegin || currentOffset > record.offsetEnd)
+                {
+                    continue;
+                }
+
+                if (record.objectSignatureLength < 8)
+                {
+                    continue;
+                }
+
+                size_t const signatureLength = static_cast<size_t>(record.objectSignatureLength);
+                if (position + signatureLength > bytes.size())
+                {
+                    continue;
+                }
+
+                signatureBytes.assign(
+                    bytes.begin() + static_cast<std::ptrdiff_t>(position),
+                    bytes.begin() + static_cast<std::ptrdiff_t>(position + signatureLength));
+
+                std::vector<unsigned char> computedHash;
+                if (!ComputeSha256(signatureBytes, computedHash))
+                {
+                    continue;
+                }
+
+                if (computedHash == record.objectSignature)
+                {
+                    detectedThreat = record.threatName.empty() ? L"Malware signature" : record.threatName;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    long ScanSingleFileWithState(
+        std::wstring const& filePath,
+        AvBaseState const& baseState,
+        ScanAggregateResult& aggregate)
+    {
+        if (filePath.empty())
+        {
+            aggregate.details = L"File path is empty.";
+            return ZIVPO_RPC_STATUS_INVALID_ARGUMENT;
+        }
+
+        std::error_code fsError;
+        if (!std::filesystem::exists(std::filesystem::path(filePath), fsError) ||
+            !std::filesystem::is_regular_file(std::filesystem::path(filePath), fsError))
+        {
+            aggregate.details = L"File was not found.";
+            return ZIVPO_RPC_STATUS_INVALID_ARGUMENT;
+        }
+
+        std::vector<unsigned char> bytes;
+        if (!ReadFileBytes(filePath, bytes))
+        {
+            aggregate.details = L"Failed to read file.";
+            return ZIVPO_RPC_STATUS_SCAN_FAILED;
+        }
+
+        AvObjectType objectType = DetectObjectType(filePath, bytes);
+        std::wstring threat;
+        bool malicious = ScanBytesWithBase(bytes, objectType, baseState, threat);
+
+        aggregate.completed = true;
+        aggregate.malicious = malicious;
+        aggregate.scannedObjects = 1;
+        aggregate.infectedObjects = malicious ? 1 : 0;
+        aggregate.targetPath = filePath;
+        aggregate.detectedThreat = malicious ? threat : L"";
+        aggregate.details = malicious ? L"Malicious signature detected." : L"No threats detected.";
+        return ZIVPO_RPC_STATUS_OK;
+    }
+
+    long ScanDirectoryWithState(
+        std::wstring const& directoryPath,
+        AvBaseState const& baseState,
+        ScanAggregateResult& aggregate)
+    {
+        if (directoryPath.empty())
+        {
+            aggregate.details = L"Directory path is empty.";
+            return ZIVPO_RPC_STATUS_INVALID_ARGUMENT;
+        }
+
+        std::error_code fsError;
+        std::filesystem::path root(directoryPath);
+        if (!std::filesystem::exists(root, fsError) || !std::filesystem::is_directory(root, fsError))
+        {
+            aggregate.details = L"Directory was not found.";
+            return ZIVPO_RPC_STATUS_INVALID_ARGUMENT;
+        }
+
+        aggregate.completed = true;
+        aggregate.targetPath = directoryPath;
+        aggregate.details = L"No threats detected.";
+
+        for (auto const& entry : std::filesystem::recursive_directory_iterator(
+            root,
+            std::filesystem::directory_options::skip_permission_denied,
+            fsError))
+        {
+            if (fsError)
+            {
+                fsError.clear();
+                continue;
+            }
+
+            if (!entry.is_regular_file(fsError))
+            {
+                fsError.clear();
+                continue;
+            }
+
+            std::wstring filePath = entry.path().wstring();
+            std::vector<unsigned char> bytes;
+            if (!ReadFileBytes(filePath, bytes))
+            {
+                continue;
+            }
+
+            ++aggregate.scannedObjects;
+            AvObjectType objectType = DetectObjectType(filePath, bytes);
+            std::wstring threat;
+            if (ScanBytesWithBase(bytes, objectType, baseState, threat))
+            {
+                aggregate.malicious = true;
+                ++aggregate.infectedObjects;
+                if (aggregate.detectedThreat.empty())
+                {
+                    aggregate.detectedThreat = threat;
+                }
+            }
+        }
+
+        if (aggregate.malicious)
+        {
+            aggregate.details = L"Threats detected in directory.";
+        }
+
+        return ZIVPO_RPC_STATUS_OK;
     }
 
     std::wstring GetDeviceName();
@@ -1674,6 +2368,85 @@ namespace
             : (now + std::chrono::hours(12));
     }
 
+    void StopAvWorkerThread();
+
+    void StartAvWorkerThread()
+    {
+        if (g_avWorkerStopEvent == nullptr || g_avWorkerThread != nullptr)
+        {
+            return;
+        }
+        ResetEvent(g_avWorkerStopEvent);
+
+        auto workerProc = [](LPVOID) -> DWORD
+        {
+            while (!g_serviceStopping.load())
+            {
+                ServiceAuthState authSnapshot{};
+                {
+                    std::lock_guard lock(g_authStateMutex);
+                    authSnapshot = g_authState;
+                }
+
+                if (!authSnapshot.authenticated || !authSnapshot.hasLicenseTicket || authSnapshot.accessToken.empty())
+                {
+                    std::lock_guard lock(g_avBaseMutex);
+                    ClearAvBaseStateLocked(g_avBaseState);
+                    break;
+                }
+
+                ApiUrlParts api{};
+                if (ParseApiUrlParts(GetApiBaseUrl(), api))
+                {
+                    AvBaseState refreshed{};
+                    long refreshStatus = LoadAvBaseFromServer(api, authSnapshot.accessToken, refreshed);
+                    if (refreshStatus == ZIVPO_RPC_STATUS_OK)
+                    {
+                        std::lock_guard lock(g_avBaseMutex);
+                        g_avBaseState = std::move(refreshed);
+                    }
+                    else if (refreshStatus == ZIVPO_RPC_STATUS_NO_LICENSE || refreshStatus == ZIVPO_RPC_STATUS_NOT_AUTHENTICATED)
+                    {
+                        std::lock_guard authLock(g_authStateMutex);
+                        g_authState.hasLicenseTicket = false;
+                        g_authState.licenseBlocked = false;
+                        g_authState.licenseExpirationDate.clear();
+                        g_authState.licenseRefreshAt = {};
+                        std::lock_guard avLock(g_avBaseMutex);
+                        ClearAvBaseStateLocked(g_avBaseState);
+                        break;
+                    }
+                }
+
+                HANDLE waitHandles[2] = { g_avWorkerStopEvent, g_sessionMonitorStopEvent };
+                DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, kAvBaseRefreshIntervalMs);
+                if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_OBJECT_0 + 1)
+                {
+                    break;
+                }
+            }
+
+            return 0;
+        };
+
+        g_avWorkerThread = CreateThread(nullptr, 0, workerProc, nullptr, 0, nullptr);
+    }
+
+    void StopAvWorkerThread()
+    {
+        if (g_avWorkerStopEvent != nullptr)
+        {
+            SetEvent(g_avWorkerStopEvent);
+        }
+
+        if (g_avWorkerThread != nullptr)
+        {
+            WaitForSingleObject(g_avWorkerThread, 10000);
+            CloseHandle(g_avWorkerThread);
+            g_avWorkerThread = nullptr;
+        }
+    }
+
     void EnsureAuthWorkerStarted()
     {
         if (g_authWorkerStopEvent == nullptr || g_authWorkerThread != nullptr)
@@ -1723,6 +2496,8 @@ namespace
                         {
                             std::lock_guard lock(g_authStateMutex);
                             ClearAuthStateLocked(g_authState);
+                            std::lock_guard avLock(g_avBaseMutex);
+                            ClearAvBaseStateLocked(g_avBaseState);
                         }
                     }
 
@@ -1755,6 +2530,8 @@ namespace
                                 g_authState.licenseBlocked = false;
                                 g_authState.licenseExpirationDate.clear();
                                 g_authState.licenseRefreshAt = {};
+                                std::lock_guard avLock(g_avBaseMutex);
+                                ClearAvBaseStateLocked(g_avBaseState);
                             }
                         }
 
@@ -1771,6 +2548,20 @@ namespace
                     {
                         waitMs = static_cast<DWORD>(std::min<long long>(waitMs, tokenDelay));
                     }
+                }
+
+                bool shouldRunAvWorker = false;
+                {
+                    std::lock_guard lock(g_authStateMutex);
+                    shouldRunAvWorker = g_authState.authenticated && g_authState.hasLicenseTicket;
+                }
+                if (shouldRunAvWorker)
+                {
+                    StartAvWorkerThread();
+                }
+                else
+                {
+                    StopAvWorkerThread();
                 }
 
                 HANDLE waitHandles[2] = { g_authWorkerStopEvent, g_sessionMonitorStopEvent };
@@ -1915,9 +2706,15 @@ namespace
         g_sessionMonitorThread = nullptr;
         g_authWorkerStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         g_authWorkerThread = nullptr;
+        g_avWorkerStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_avWorkerThread = nullptr;
         {
             std::lock_guard lock(g_authStateMutex);
             ClearAuthStateLocked(g_authState);
+        }
+        {
+            std::lock_guard lock(g_avBaseMutex);
+            ClearAvBaseStateLocked(g_avBaseState);
         }
 
         UpdateServiceStatus(SERVICE_START_PENDING, NO_ERROR, 5000);
@@ -1926,6 +2723,12 @@ namespace
         if (rpcStatus != RPC_S_OK)
         {
             g_serviceStopping = true;
+            StopAvWorkerThread();
+            if (g_avWorkerStopEvent != nullptr)
+            {
+                CloseHandle(g_avWorkerStopEvent);
+                g_avWorkerStopEvent = nullptr;
+            }
             StopAuthWorkerThread();
             StopSessionMonitorThread();
             UpdateServiceStatus(SERVICE_STOPPED, rpcStatus, 0);
@@ -1940,6 +2743,12 @@ namespace
 
         g_serviceStopping = true;
         UpdateServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
+        StopAvWorkerThread();
+        if (g_avWorkerStopEvent != nullptr)
+        {
+            CloseHandle(g_avWorkerStopEvent);
+            g_avWorkerStopEvent = nullptr;
+        }
         StopAuthWorkerThread();
         StopSessionMonitorThread();
         UnregisterRpcInterface();
@@ -2048,29 +2857,73 @@ extern "C" long RpcLogin(
         SetRpcLicenseInfo(licenseInfo, g_authState);
     }
 
+    if (licenseStatus == ZIVPO_RPC_STATUS_OK)
+    {
+        std::wstring accessTokenSnapshot;
+        {
+            std::lock_guard lock(g_authStateMutex);
+            accessTokenSnapshot = g_authState.accessToken;
+        }
+
+        AvBaseState loadedBase{};
+        long loadStatus = LoadAvBaseFromServer(api, accessTokenSnapshot, loadedBase);
+        if (loadStatus == ZIVPO_RPC_STATUS_OK)
+        {
+            std::lock_guard lock(g_avBaseMutex);
+            g_avBaseState = std::move(loadedBase);
+        }
+        StartAvWorkerThread();
+    }
+    else
+    {
+        {
+            std::lock_guard lock(g_avBaseMutex);
+            ClearAvBaseStateLocked(g_avBaseState);
+        }
+        StopAvWorkerThread();
+    }
+
     EnsureAuthWorkerStarted();
     return ZIVPO_RPC_STATUS_OK;
 }
 
 extern "C" long RpcLogout([[maybe_unused]] handle_t hBinding)
 {
-    std::lock_guard lock(g_authStateMutex);
-    ClearAuthStateLocked(g_authState);
+    {
+        std::lock_guard lock(g_authStateMutex);
+        ClearAuthStateLocked(g_authState);
+    }
+    {
+        std::lock_guard avLock(g_avBaseMutex);
+        ClearAvBaseStateLocked(g_avBaseState);
+    }
+    StopAvWorkerThread();
     return ZIVPO_RPC_STATUS_OK;
 }
 
 extern "C" long RpcGetLicenseInfo([[maybe_unused]] handle_t hBinding, ZIVPO_RPC_LICENSE_INFO* licenseInfo)
 {
-    std::lock_guard lock(g_authStateMutex);
-    SetRpcLicenseInfo(licenseInfo, g_authState);
+    bool authenticated = false;
+    bool hasLicense = false;
+    {
+        std::lock_guard lock(g_authStateMutex);
+        SetRpcLicenseInfo(licenseInfo, g_authState);
+        authenticated = g_authState.authenticated;
+        hasLicense = g_authState.hasLicenseTicket;
+    }
 
-    if (!g_authState.authenticated)
+    if (!authenticated)
     {
         return ZIVPO_RPC_STATUS_NOT_AUTHENTICATED;
     }
 
-    if (!g_authState.hasLicenseTicket)
+    if (!hasLicense)
     {
+        {
+            std::lock_guard avLock(g_avBaseMutex);
+            ClearAvBaseStateLocked(g_avBaseState);
+        }
+        StopAvWorkerThread();
         return ZIVPO_RPC_STATUS_NO_LICENSE;
     }
 
@@ -2167,7 +3020,178 @@ extern "C" long RpcActivateProduct(
         SetRpcLicenseInfo(licenseInfo, g_authState);
     }
 
+    AvBaseState loadedBase{};
+    long loadStatus = LoadAvBaseFromServer(api, snapshot.accessToken, loadedBase);
+    if (loadStatus == ZIVPO_RPC_STATUS_OK)
+    {
+        std::lock_guard lock(g_avBaseMutex);
+        g_avBaseState = std::move(loadedBase);
+    }
+    StartAvWorkerThread();
+
     return ZIVPO_RPC_STATUS_OK;
+}
+
+extern "C" long RpcGetAvBaseInfo([[maybe_unused]] handle_t hBinding, ZIVPO_RPC_AV_BASE_INFO* avBaseInfo)
+{
+    if (avBaseInfo == nullptr)
+    {
+        return ZIVPO_RPC_STATUS_INVALID_ARGUMENT;
+    }
+
+    ServiceAuthState authSnapshot{};
+    {
+        std::lock_guard lock(g_authStateMutex);
+        authSnapshot = g_authState;
+    }
+
+    if (!authSnapshot.authenticated)
+    {
+        return ZIVPO_RPC_STATUS_NOT_AUTHENTICATED;
+    }
+
+    if (!authSnapshot.hasLicenseTicket)
+    {
+        return ZIVPO_RPC_STATUS_NO_LICENSE;
+    }
+
+    {
+        std::lock_guard lock(g_avBaseMutex);
+        if (!g_avBaseState.loaded)
+        {
+            ApiUrlParts api{};
+            if (!ParseApiUrlParts(GetApiBaseUrl(), api))
+            {
+                return ZIVPO_RPC_STATUS_NETWORK_ERROR;
+            }
+
+            AvBaseState loadedBase{};
+            long loadStatus = LoadAvBaseFromServer(api, authSnapshot.accessToken, loadedBase);
+            if (loadStatus != ZIVPO_RPC_STATUS_OK)
+            {
+                return loadStatus;
+            }
+
+            g_avBaseState = std::move(loadedBase);
+            StartAvWorkerThread();
+        }
+
+        SetRpcAvBaseInfo(avBaseInfo, g_avBaseState);
+    }
+
+    return ZIVPO_RPC_STATUS_OK;
+}
+
+extern "C" long RpcScanFile(
+    [[maybe_unused]] handle_t hBinding,
+    const wchar_t* filePath,
+    ZIVPO_RPC_SCAN_RESULT* scanResult)
+{
+    if (scanResult == nullptr || filePath == nullptr)
+    {
+        return ZIVPO_RPC_STATUS_INVALID_ARGUMENT;
+    }
+
+    ServiceAuthState authSnapshot{};
+    {
+        std::lock_guard lock(g_authStateMutex);
+        authSnapshot = g_authState;
+    }
+
+    if (!authSnapshot.authenticated)
+    {
+        return ZIVPO_RPC_STATUS_NOT_AUTHENTICATED;
+    }
+
+    if (!authSnapshot.hasLicenseTicket)
+    {
+        return ZIVPO_RPC_STATUS_NO_LICENSE;
+    }
+
+    AvBaseState baseSnapshot{};
+    {
+        std::lock_guard lock(g_avBaseMutex);
+        if (!g_avBaseState.loaded)
+        {
+            ApiUrlParts api{};
+            if (!ParseApiUrlParts(GetApiBaseUrl(), api))
+            {
+                return ZIVPO_RPC_STATUS_NETWORK_ERROR;
+            }
+
+            AvBaseState loadedBase{};
+            long loadStatus = LoadAvBaseFromServer(api, authSnapshot.accessToken, loadedBase);
+            if (loadStatus != ZIVPO_RPC_STATUS_OK)
+            {
+                return loadStatus;
+            }
+
+            g_avBaseState = std::move(loadedBase);
+            StartAvWorkerThread();
+        }
+        baseSnapshot = g_avBaseState;
+    }
+
+    ScanAggregateResult aggregate{};
+    long scanStatus = ScanSingleFileWithState(filePath, baseSnapshot, aggregate);
+    SetRpcScanResult(scanResult, aggregate);
+    return scanStatus;
+}
+
+extern "C" long RpcScanDirectory(
+    [[maybe_unused]] handle_t hBinding,
+    const wchar_t* directoryPath,
+    ZIVPO_RPC_SCAN_RESULT* scanResult)
+{
+    if (scanResult == nullptr || directoryPath == nullptr)
+    {
+        return ZIVPO_RPC_STATUS_INVALID_ARGUMENT;
+    }
+
+    ServiceAuthState authSnapshot{};
+    {
+        std::lock_guard lock(g_authStateMutex);
+        authSnapshot = g_authState;
+    }
+
+    if (!authSnapshot.authenticated)
+    {
+        return ZIVPO_RPC_STATUS_NOT_AUTHENTICATED;
+    }
+
+    if (!authSnapshot.hasLicenseTicket)
+    {
+        return ZIVPO_RPC_STATUS_NO_LICENSE;
+    }
+
+    AvBaseState baseSnapshot{};
+    {
+        std::lock_guard lock(g_avBaseMutex);
+        if (!g_avBaseState.loaded)
+        {
+            ApiUrlParts api{};
+            if (!ParseApiUrlParts(GetApiBaseUrl(), api))
+            {
+                return ZIVPO_RPC_STATUS_NETWORK_ERROR;
+            }
+
+            AvBaseState loadedBase{};
+            long loadStatus = LoadAvBaseFromServer(api, authSnapshot.accessToken, loadedBase);
+            if (loadStatus != ZIVPO_RPC_STATUS_OK)
+            {
+                return loadStatus;
+            }
+
+            g_avBaseState = std::move(loadedBase);
+            StartAvWorkerThread();
+        }
+        baseSnapshot = g_avBaseState;
+    }
+
+    ScanAggregateResult aggregate{};
+    long scanStatus = ScanDirectoryWithState(directoryPath, baseSnapshot, aggregate);
+    SetRpcScanResult(scanResult, aggregate);
+    return scanStatus;
 }
 
 namespace ZIVPO::Service
@@ -2239,6 +3263,24 @@ namespace ZIVPO::Service
             licenseInfo.hasLicense = rpcLicense.hasLicense != 0;
             licenseInfo.blocked = rpcLicense.licenseBlocked != 0;
             licenseInfo.expirationDate = rpcLicense.expirationDate;
+        }
+
+        void FillAvBaseInfo(ZIVPO_RPC_AV_BASE_INFO const& rpcAvBase, AvBaseInfo& avBaseInfo)
+        {
+            avBaseInfo.loaded = rpcAvBase.loaded != 0;
+            avBaseInfo.recordsCount = static_cast<unsigned long long>(rpcAvBase.recordsCount);
+            avBaseInfo.releaseDate = rpcAvBase.releaseDate;
+        }
+
+        void FillScanResult(ZIVPO_RPC_SCAN_RESULT const& rpcScanResult, ScanResult& scanResult)
+        {
+            scanResult.completed = rpcScanResult.completed != 0;
+            scanResult.malicious = rpcScanResult.malicious != 0;
+            scanResult.scannedObjects = static_cast<unsigned long long>(rpcScanResult.scannedObjects);
+            scanResult.infectedObjects = static_cast<unsigned long long>(rpcScanResult.infectedObjects);
+            scanResult.targetPath = rpcScanResult.targetPath;
+            scanResult.detectedThreat = rpcScanResult.detectedThreat;
+            scanResult.details = rpcScanResult.details;
         }
 
         long RpcStopServiceSafe(RPC_BINDING_HANDLE bindingHandle) noexcept
@@ -2337,6 +3379,54 @@ namespace ZIVPO::Service
                 rpcStatus = ZIVPO_RPC_STATUS_NETWORK_ERROR;
             }
 
+            return rpcStatus;
+        }
+
+        long RpcGetAvBaseInfoSafe(RPC_BINDING_HANDLE bindingHandle, ZIVPO_RPC_AV_BASE_INFO* avBaseInfo) noexcept
+        {
+            long rpcStatus = ZIVPO_RPC_STATUS_NETWORK_ERROR;
+            __try
+            {
+                rpcStatus = RpcGetAvBaseInfo(bindingHandle, avBaseInfo);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                rpcStatus = ZIVPO_RPC_STATUS_NETWORK_ERROR;
+            }
+            return rpcStatus;
+        }
+
+        long RpcScanFileSafe(
+            RPC_BINDING_HANDLE bindingHandle,
+            wchar_t const* filePath,
+            ZIVPO_RPC_SCAN_RESULT* scanResult) noexcept
+        {
+            long rpcStatus = ZIVPO_RPC_STATUS_NETWORK_ERROR;
+            __try
+            {
+                rpcStatus = RpcScanFile(bindingHandle, filePath, scanResult);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                rpcStatus = ZIVPO_RPC_STATUS_NETWORK_ERROR;
+            }
+            return rpcStatus;
+        }
+
+        long RpcScanDirectorySafe(
+            RPC_BINDING_HANDLE bindingHandle,
+            wchar_t const* directoryPath,
+            ZIVPO_RPC_SCAN_RESULT* scanResult) noexcept
+        {
+            long rpcStatus = ZIVPO_RPC_STATUS_NETWORK_ERROR;
+            __try
+            {
+                rpcStatus = RpcScanDirectory(bindingHandle, directoryPath, scanResult);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                rpcStatus = ZIVPO_RPC_STATUS_NETWORK_ERROR;
+            }
             return rpcStatus;
         }
     }
@@ -2446,6 +3536,56 @@ namespace ZIVPO::Service
         long rpcStatus = RpcActivateProductSafe(bindingHandle, activationKeyValue.c_str(), &rpcLicense);
         RpcBindingFree(&bindingHandle);
         FillLicenseInfo(rpcLicense, licenseInfo);
+        return BuildResultFromRpcStatus(rpcStatus);
+    }
+
+    RpcCallResult GetAvBaseInfo(AvBaseInfo& avBaseInfo)
+    {
+        avBaseInfo = {};
+        RPC_BINDING_HANDLE bindingHandle = nullptr;
+        if (!CreateRpcBinding(bindingHandle))
+        {
+            return { RpcStatusCode::NetworkError, false };
+        }
+
+        ZIVPO_RPC_AV_BASE_INFO rpcAvBase{};
+        long rpcStatus = RpcGetAvBaseInfoSafe(bindingHandle, &rpcAvBase);
+        RpcBindingFree(&bindingHandle);
+        FillAvBaseInfo(rpcAvBase, avBaseInfo);
+        return BuildResultFromRpcStatus(rpcStatus);
+    }
+
+    RpcCallResult ScanFile(std::wstring_view filePath, ScanResult& scanResult)
+    {
+        scanResult = {};
+        RPC_BINDING_HANDLE bindingHandle = nullptr;
+        if (!CreateRpcBinding(bindingHandle))
+        {
+            return { RpcStatusCode::NetworkError, false };
+        }
+
+        ZIVPO_RPC_SCAN_RESULT rpcScanResult{};
+        std::wstring path(filePath);
+        long rpcStatus = RpcScanFileSafe(bindingHandle, path.c_str(), &rpcScanResult);
+        RpcBindingFree(&bindingHandle);
+        FillScanResult(rpcScanResult, scanResult);
+        return BuildResultFromRpcStatus(rpcStatus);
+    }
+
+    RpcCallResult ScanDirectory(std::wstring_view directoryPath, ScanResult& scanResult)
+    {
+        scanResult = {};
+        RPC_BINDING_HANDLE bindingHandle = nullptr;
+        if (!CreateRpcBinding(bindingHandle))
+        {
+            return { RpcStatusCode::NetworkError, false };
+        }
+
+        ZIVPO_RPC_SCAN_RESULT rpcScanResult{};
+        std::wstring path(directoryPath);
+        long rpcStatus = RpcScanDirectorySafe(bindingHandle, path.c_str(), &rpcScanResult);
+        RpcBindingFree(&bindingHandle);
+        FillScanResult(rpcScanResult, scanResult);
         return BuildResultFromRpcStatus(rpcStatus);
     }
 }

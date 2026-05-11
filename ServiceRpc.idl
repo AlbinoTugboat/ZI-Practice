@@ -18,6 +18,24 @@ interface ZivpoServiceControl
         wchar_t expirationDate[64];
     } ZIVPO_RPC_LICENSE_INFO;
 
+    typedef struct _ZIVPO_RPC_AV_BASE_INFO
+    {
+        long loaded;
+        hyper recordsCount;
+        wchar_t releaseDate[64];
+    } ZIVPO_RPC_AV_BASE_INFO;
+
+    typedef struct _ZIVPO_RPC_SCAN_RESULT
+    {
+        long completed;
+        long malicious;
+        hyper scannedObjects;
+        hyper infectedObjects;
+        wchar_t targetPath[520];
+        wchar_t detectedThreat[128];
+        wchar_t details[256];
+    } ZIVPO_RPC_SCAN_RESULT;
+
     const long ZIVPO_RPC_STATUS_OK = 0;
     const long ZIVPO_RPC_STATUS_NOT_AUTHENTICATED = 1;
     const long ZIVPO_RPC_STATUS_INVALID_CREDENTIALS = 2;
@@ -25,6 +43,8 @@ interface ZivpoServiceControl
     const long ZIVPO_RPC_STATUS_ACTIVATION_FAILED = 4;
     const long ZIVPO_RPC_STATUS_NETWORK_ERROR = 5;
     const long ZIVPO_RPC_STATUS_INTERNAL_ERROR = 6;
+    const long ZIVPO_RPC_STATUS_INVALID_ARGUMENT = 7;
+    const long ZIVPO_RPC_STATUS_SCAN_FAILED = 8;
 
     void RpcStopService([in] handle_t hBinding);
 
@@ -49,4 +69,18 @@ interface ZivpoServiceControl
         [in] handle_t hBinding,
         [in, string] const wchar_t* activationKey,
         [out] ZIVPO_RPC_LICENSE_INFO* licenseInfo);
+
+    long RpcGetAvBaseInfo(
+        [in] handle_t hBinding,
+        [out] ZIVPO_RPC_AV_BASE_INFO* avBaseInfo);
+
+    long RpcScanFile(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* filePath,
+        [out] ZIVPO_RPC_SCAN_RESULT* scanResult);
+
+    long RpcScanDirectory(
+        [in] handle_t hBinding,
+        [in, string] const wchar_t* directoryPath,
+        [out] ZIVPO_RPC_SCAN_RESULT* scanResult);
 }

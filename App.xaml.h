@@ -23,6 +23,8 @@ namespace winrt::ZIVPO::implementation
         void OnLoginClick(winrt::Windows::Foundation::IInspectable const& sender, Microsoft::UI::Xaml::RoutedEventArgs const& args);
         void OnActivateClick(winrt::Windows::Foundation::IInspectable const& sender, Microsoft::UI::Xaml::RoutedEventArgs const& args);
         void OnLogoutClick(winrt::Windows::Foundation::IInspectable const& sender, Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnScanFileClick(winrt::Windows::Foundation::IInspectable const& sender, Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnScanDirectoryClick(winrt::Windows::Foundation::IInspectable const& sender, Microsoft::UI::Xaml::RoutedEventArgs const& args);
         void RefreshStateFromService(bool showErrors);
         void UpdateUiState();
         void StartLicensePolling();
@@ -30,10 +32,6 @@ namespace winrt::ZIVPO::implementation
         void OnMainMenuExitClick(winrt::Windows::Foundation::IInspectable const& sender, Microsoft::UI::Xaml::RoutedEventArgs const& args);
         void RunOnUiThread(std::function<void()> action);
         HWND MainWindowHandle() const;
-        void EnsureMainWindowHooked();
-        void EnsureMainWindowMenu();
-        static LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
-        LRESULT HandleMainWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
         void ShowMainWindow();
         void HideMainWindow();
         void ExitApplication();
@@ -46,8 +44,6 @@ namespace winrt::ZIVPO::implementation
         HANDLE m_singleInstanceMutex{ nullptr };
         winrt::event_token m_windowClosedToken{};
         bool m_windowClosedHandlerAttached{ false };
-        HWND m_mainWindowHwnd{ nullptr };
-        WNDPROC m_originalMainWindowProc{ nullptr };
         bool m_isExiting{ false };
         bool m_uiInitialized{ false };
         bool m_showWindowInProgress{ false };
@@ -60,7 +56,13 @@ namespace winrt::ZIVPO::implementation
         winrt::Microsoft::UI::Xaml::Controls::TextBlock m_userStatusText{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::TextBlock m_licenseStatusText{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::TextBlock m_antivirusStatusText{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::TextBlock m_avBaseInfoText{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::TextBlock m_scanResultText{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::TextBox m_scanFilePathInput{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::TextBox m_scanDirectoryPathInput{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Button m_antivirusActionButton{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::Button m_scanFileButton{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::Button m_scanDirectoryButton{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Button m_logoutButton{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::StackPanel m_authPanel{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::TextBox m_usernameInput{ nullptr };
