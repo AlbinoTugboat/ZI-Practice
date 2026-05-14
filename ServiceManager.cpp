@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <optional>
 #include <regex>
@@ -54,6 +55,7 @@ namespace
     constexpr wchar_t kApiLicenseCheckPath[] = L"/api/user/licenses/check";
     constexpr wchar_t kApiLicenseActivatePath[] = L"/api/user/licenses/activate";
     constexpr wchar_t kApiUserSignaturesPath[] = L"/api/user/signatures";
+    constexpr wchar_t kApiBinarySignaturesFullPath[] = L"/api/binary/signatures/full";
     constexpr long long kTokenRefreshSafetyWindowSeconds = 30;
     constexpr long long kLicenseRefreshSafetyWindowSeconds = 30;
     constexpr long long kDefaultProductId = 1;
@@ -693,7 +695,9 @@ namespace
     struct AvSignatureRecord
     {
         unsigned long long objectSignaturePrefix{ 0 };
+        std::vector<unsigned char> objectSignaturePrefixBytes;
         unsigned long objectSignatureLength{ 0 };
+        unsigned long remainderLength{ 0 };
         std::vector<unsigned char> objectSignature;
         long long offsetBegin{ 0 };
         long long offsetEnd{ 0 };
@@ -706,6 +710,7 @@ namespace
     {
         bool loaded{ false };
         std::map<unsigned long long, std::vector<AvSignatureRecord>> recordsByPrefix;
+        std::map<unsigned int, std::vector<AvSignatureRecord>> shortPrefixRecordsByFirstByte;
         std::wstring releaseDate;
         unsigned long long recordsCount{ 0 };
         std::chrono::system_clock::time_point loadedAt{};
@@ -914,15 +919,18 @@ namespace
     {
         bool ok{ false };
         DWORD statusCode{ 0 };
+        std::wstring contentType;
         std::string body;
     };
 
-    HttpResult SendJsonRequest(
+    HttpResult SendHttpRequest(
         ApiUrlParts const& api,
         std::wstring const& method,
         std::wstring const& path,
         std::string const& requestBodyUtf8,
-        std::wstring const& bearerToken)
+        std::wstring const& bearerToken,
+        std::wstring const& contentTypeHeader,
+        std::wstring const& acceptHeader)
     {
         HttpResult result{};
 
@@ -973,7 +981,19 @@ namespace
             WinHttpSetOption(request, WINHTTP_OPTION_SECURITY_FLAGS, &securityFlags, sizeof(securityFlags));
         }
 
-        std::wstring headers = L"Content-Type: application/json\r\nAccept: application/json\r\n";
+        std::wstring headers;
+        if (!contentTypeHeader.empty())
+        {
+            headers.append(L"Content-Type: ");
+            headers.append(contentTypeHeader);
+            headers.append(L"\r\n");
+        }
+        if (!acceptHeader.empty())
+        {
+            headers.append(L"Accept: ");
+            headers.append(acceptHeader);
+            headers.append(L"\r\n");
+        }
         if (!bearerToken.empty())
         {
             headers.append(L"Authorization: Bearer ");
@@ -1008,6 +1028,29 @@ namespace
             WINHTTP_NO_HEADER_INDEX);
         result.statusCode = statusCode;
 
+        DWORD contentTypeSizeBytes = 0;
+        WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_CONTENT_TYPE,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            WINHTTP_NO_OUTPUT_BUFFER,
+            &contentTypeSizeBytes,
+            WINHTTP_NO_HEADER_INDEX);
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && contentTypeSizeBytes >= sizeof(wchar_t))
+        {
+            std::vector<wchar_t> contentTypeBuffer(contentTypeSizeBytes / sizeof(wchar_t), L'\0');
+            if (WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_CONTENT_TYPE,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                contentTypeBuffer.data(),
+                &contentTypeSizeBytes,
+                WINHTTP_NO_HEADER_INDEX))
+            {
+                result.contentType.assign(contentTypeBuffer.data());
+            }
+        }
+
         std::string body;
         DWORD availableBytes = 0;
         while (WinHttpQueryDataAvailable(request, &availableBytes) && availableBytes > 0)
@@ -1033,6 +1076,39 @@ namespace
         WinHttpCloseHandle(connect);
         WinHttpCloseHandle(session);
         return result;
+    }
+
+    HttpResult SendJsonRequest(
+        ApiUrlParts const& api,
+        std::wstring const& method,
+        std::wstring const& path,
+        std::string const& requestBodyUtf8,
+        std::wstring const& bearerToken)
+    {
+        return SendHttpRequest(
+            api,
+            method,
+            path,
+            requestBodyUtf8,
+            bearerToken,
+            L"application/json",
+            L"application/json");
+    }
+
+    HttpResult SendBinaryRequest(
+        ApiUrlParts const& api,
+        std::wstring const& method,
+        std::wstring const& path,
+        std::wstring const& bearerToken)
+    {
+        return SendHttpRequest(
+            api,
+            method,
+            path,
+            "",
+            bearerToken,
+            L"",
+            L"multipart/mixed");
     }
 
     void ClearAvBaseStateLocked(AvBaseState& state)
@@ -1127,12 +1203,19 @@ namespace
         return bytes;
     }
 
-    bool ComputeSha256(std::vector<unsigned char> const& data, std::vector<unsigned char>& hashOut)
+    bool ComputeHash(
+        wchar_t const* algorithmName,
+        std::vector<unsigned char> const& data,
+        std::vector<unsigned char>& hashOut)
     {
         hashOut.clear();
+        if (algorithmName == nullptr)
+        {
+            return false;
+        }
 
         BCRYPT_ALG_HANDLE algorithm = nullptr;
-        NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+        NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, algorithmName, nullptr, 0);
         if (status != 0)
         {
             return false;
@@ -1200,6 +1283,11 @@ namespace
         BCryptDestroyHash(hashHandle);
         BCryptCloseAlgorithmProvider(algorithm, 0);
         return status == 0;
+    }
+
+    bool ComputeSha256(std::vector<unsigned char> const& data, std::vector<unsigned char>& hashOut)
+    {
+        return ComputeHash(BCRYPT_SHA256_ALGORITHM, data, hashOut);
     }
 
     std::vector<std::string> SplitJsonArrayObjects(std::string const& json)
@@ -1317,13 +1405,18 @@ namespace
 
         std::optional<std::vector<unsigned char>> prefixBytes = DecodeHex(*firstBytesHex);
         std::optional<std::vector<unsigned char>> objectSignature = DecodeHex(*objectSignatureHex);
-        if (!prefixBytes.has_value() || !objectSignature.has_value() || prefixBytes->size() < 8 || *remainderLength < 0)
+        if (!prefixBytes.has_value() || !objectSignature.has_value() || prefixBytes->empty() || *remainderLength < 0)
         {
             return false;
         }
 
-        record.objectSignaturePrefix = ReadPrefixAsU64(prefixBytes->data());
-        record.objectSignatureLength = static_cast<unsigned long>(8 + *remainderLength);
+        record.objectSignaturePrefixBytes = std::move(*prefixBytes);
+        if (record.objectSignaturePrefixBytes.size() >= 8)
+        {
+            record.objectSignaturePrefix = ReadPrefixAsU64(record.objectSignaturePrefixBytes.data());
+        }
+        record.remainderLength = static_cast<unsigned long>(*remainderLength);
+        record.objectSignatureLength = static_cast<unsigned long>(record.objectSignaturePrefixBytes.size() + record.remainderLength);
         record.objectSignature = std::move(*objectSignature);
         record.offsetBegin = *offsetStart;
         record.offsetEnd = *offsetEnd;
@@ -1346,9 +1439,529 @@ namespace
         return true;
     }
 
+    std::string ToLowerAscii(std::string value)
+    {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch)
+        {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return value;
+    }
+
+    std::string TrimAscii(std::string value)
+    {
+        auto isSpace = [](unsigned char ch)
+        {
+            return std::isspace(ch) != 0;
+        };
+
+        while (!value.empty() && isSpace(static_cast<unsigned char>(value.front())))
+        {
+            value.erase(value.begin());
+        }
+        while (!value.empty() && isSpace(static_cast<unsigned char>(value.back())))
+        {
+            value.pop_back();
+        }
+        return value;
+    }
+
+    std::optional<std::string> ExtractMultipartBoundary(std::wstring const& contentType)
+    {
+        if (contentType.empty())
+        {
+            return std::nullopt;
+        }
+
+        std::string raw = WideToUtf8(contentType);
+        std::string lower = ToLowerAscii(raw);
+        size_t boundaryPos = lower.find("boundary=");
+        if (boundaryPos == std::string::npos)
+        {
+            return std::nullopt;
+        }
+
+        boundaryPos += 9;
+        if (boundaryPos >= raw.size())
+        {
+            return std::nullopt;
+        }
+
+        if (raw[boundaryPos] == '"' || raw[boundaryPos] == '\'')
+        {
+            char const quote = raw[boundaryPos];
+            size_t const endQuote = raw.find(quote, boundaryPos + 1);
+            if (endQuote == std::string::npos || endQuote <= boundaryPos + 1)
+            {
+                return std::nullopt;
+            }
+            return raw.substr(boundaryPos + 1, endQuote - (boundaryPos + 1));
+        }
+
+        size_t boundaryEnd = raw.find(';', boundaryPos);
+        if (boundaryEnd == std::string::npos)
+        {
+            boundaryEnd = raw.size();
+        }
+        std::string boundary = TrimAscii(raw.substr(boundaryPos, boundaryEnd - boundaryPos));
+        if (boundary.empty())
+        {
+            return std::nullopt;
+        }
+        return boundary;
+    }
+
+    struct MultipartParts
+    {
+        std::vector<unsigned char> manifest;
+        std::vector<unsigned char> data;
+    };
+
+    bool ParseMultipartMixedParts(std::string const& payload, std::string const& boundary, MultipartParts& parts)
+    {
+        parts = {};
+        if (payload.empty() || boundary.empty())
+        {
+            return false;
+        }
+
+        std::string const marker = "--" + boundary;
+        size_t markerPos = payload.find(marker);
+        while (markerPos != std::string::npos)
+        {
+            size_t cursor = markerPos + marker.size();
+            if (cursor + 2 <= payload.size() && payload.compare(cursor, 2, "--") == 0)
+            {
+                break;
+            }
+
+            if (cursor + 2 <= payload.size() && payload.compare(cursor, 2, "\r\n") == 0)
+            {
+                cursor += 2;
+            }
+            else if (cursor < payload.size() && payload[cursor] == '\n')
+            {
+                cursor += 1;
+            }
+
+            size_t const headersEnd = payload.find("\r\n\r\n", cursor);
+            if (headersEnd == std::string::npos)
+            {
+                return false;
+            }
+
+            std::string headersBlock = payload.substr(cursor, headersEnd - cursor);
+            cursor = headersEnd + 4;
+
+            std::optional<size_t> contentLength;
+            std::string partName;
+            std::string fileName;
+
+            size_t lineStart = 0;
+            while (lineStart < headersBlock.size())
+            {
+                size_t lineEnd = headersBlock.find("\r\n", lineStart);
+                if (lineEnd == std::string::npos)
+                {
+                    lineEnd = headersBlock.size();
+                }
+
+                std::string line = headersBlock.substr(lineStart, lineEnd - lineStart);
+                std::string lowerLine = ToLowerAscii(line);
+
+                if (lowerLine.rfind("content-length:", 0) == 0)
+                {
+                    std::string value = TrimAscii(line.substr(15));
+                    try
+                    {
+                        contentLength = static_cast<size_t>(std::stoull(value));
+                    }
+                    catch (...)
+                    {
+                        contentLength = std::nullopt;
+                    }
+                }
+                else if (lowerLine.rfind("content-disposition:", 0) == 0)
+                {
+                    auto extractToken = [&](std::string const& tokenName) -> std::string
+                    {
+                        std::string lowerTokenName = ToLowerAscii(tokenName);
+                        size_t tokenPos = lowerLine.find(lowerTokenName + "=");
+                        if (tokenPos == std::string::npos)
+                        {
+                            return {};
+                        }
+
+                        size_t valuePos = tokenPos + lowerTokenName.size() + 1;
+                        if (valuePos >= line.size())
+                        {
+                            return {};
+                        }
+
+                        if (line[valuePos] == '"' || line[valuePos] == '\'')
+                        {
+                            char const quote = line[valuePos];
+                            size_t valueEnd = line.find(quote, valuePos + 1);
+                            if (valueEnd == std::string::npos)
+                            {
+                                return {};
+                            }
+                            return line.substr(valuePos + 1, valueEnd - (valuePos + 1));
+                        }
+
+                        size_t valueEnd = line.find(';', valuePos);
+                        if (valueEnd == std::string::npos)
+                        {
+                            valueEnd = line.size();
+                        }
+                        return TrimAscii(line.substr(valuePos, valueEnd - valuePos));
+                    };
+
+                    partName = extractToken("name");
+                    fileName = extractToken("filename");
+                }
+
+                if (lineEnd == headersBlock.size())
+                {
+                    break;
+                }
+                lineStart = lineEnd + 2;
+            }
+
+            size_t dataEnd = std::string::npos;
+            if (contentLength.has_value())
+            {
+                if (cursor + *contentLength > payload.size())
+                {
+                    return false;
+                }
+                dataEnd = cursor + *contentLength;
+            }
+            else
+            {
+                std::string const markerWithCrlf = "\r\n" + marker;
+                size_t markerWithCrlfPos = payload.find(markerWithCrlf, cursor);
+                if (markerWithCrlfPos == std::string::npos)
+                {
+                    return false;
+                }
+                dataEnd = markerWithCrlfPos;
+            }
+
+            std::vector<unsigned char> dataPart(
+                payload.begin() + static_cast<std::ptrdiff_t>(cursor),
+                payload.begin() + static_cast<std::ptrdiff_t>(dataEnd));
+
+            std::string lowerName = ToLowerAscii(partName);
+            std::string lowerFile = ToLowerAscii(fileName);
+            if (lowerName == "manifest" || lowerFile == "manifest.bin")
+            {
+                parts.manifest = std::move(dataPart);
+            }
+            else if (lowerName == "data" || lowerFile == "data.bin")
+            {
+                parts.data = std::move(dataPart);
+            }
+
+            cursor = dataEnd;
+            if (cursor + 2 <= payload.size() && payload.compare(cursor, 2, "\r\n") == 0)
+            {
+                cursor += 2;
+            }
+            markerPos = payload.find(marker, cursor);
+        }
+
+        return !parts.data.empty();
+    }
+
+    class BinaryReader
+    {
+    public:
+        explicit BinaryReader(std::vector<unsigned char> const& bytes) : m_bytes(bytes) {}
+
+        bool ReadU8(unsigned char& value)
+        {
+            if (m_offset + 1 > m_bytes.size())
+            {
+                return false;
+            }
+            value = m_bytes[m_offset++];
+            return true;
+        }
+
+        bool ReadU16(unsigned short& value)
+        {
+            if (m_offset + 2 > m_bytes.size())
+            {
+                return false;
+            }
+            value = static_cast<unsigned short>(
+                (static_cast<unsigned short>(m_bytes[m_offset]) << 8) |
+                static_cast<unsigned short>(m_bytes[m_offset + 1]));
+            m_offset += 2;
+            return true;
+        }
+
+        bool ReadU32(unsigned long& value)
+        {
+            if (m_offset + 4 > m_bytes.size())
+            {
+                return false;
+            }
+            value = (static_cast<unsigned long>(m_bytes[m_offset]) << 24) |
+                (static_cast<unsigned long>(m_bytes[m_offset + 1]) << 16) |
+                (static_cast<unsigned long>(m_bytes[m_offset + 2]) << 8) |
+                static_cast<unsigned long>(m_bytes[m_offset + 3]);
+            m_offset += 4;
+            return true;
+        }
+
+        bool ReadI64(long long& value)
+        {
+            if (m_offset + 8 > m_bytes.size())
+            {
+                return false;
+            }
+
+            unsigned long long raw = 0;
+            for (int i = 0; i < 8; ++i)
+            {
+                raw = (raw << 8) | static_cast<unsigned long long>(m_bytes[m_offset + i]);
+            }
+            m_offset += 8;
+            value = static_cast<long long>(raw);
+            return true;
+        }
+
+        bool ReadBytes(size_t size, std::vector<unsigned char>& out)
+        {
+            if (m_offset + size > m_bytes.size())
+            {
+                return false;
+            }
+
+            out.assign(
+                m_bytes.begin() + static_cast<std::ptrdiff_t>(m_offset),
+                m_bytes.begin() + static_cast<std::ptrdiff_t>(m_offset + size));
+            m_offset += size;
+            return true;
+        }
+
+        bool Skip(size_t size)
+        {
+            if (m_offset + size > m_bytes.size())
+            {
+                return false;
+            }
+            m_offset += size;
+            return true;
+        }
+
+    private:
+        std::vector<unsigned char> const& m_bytes;
+        size_t m_offset{ 0 };
+    };
+
+    std::wstring FormatEpochMillisAsUtc(long long epochMillis)
+    {
+        std::chrono::milliseconds millis(epochMillis);
+        std::chrono::system_clock::time_point timePoint(millis);
+        std::time_t time = std::chrono::system_clock::to_time_t(timePoint);
+        std::tm utc{};
+        if (gmtime_s(&utc, &time) != 0)
+        {
+            return L"n/a";
+        }
+
+        wchar_t buffer[64]{};
+        StringCchPrintfW(
+            buffer,
+            ARRAYSIZE(buffer),
+            L"%04d-%02d-%02dT%02d:%02d:%02dZ",
+            utc.tm_year + 1900,
+            utc.tm_mon + 1,
+            utc.tm_mday,
+            utc.tm_hour,
+            utc.tm_min,
+            utc.tm_sec);
+        return buffer;
+    }
+
+    bool ParseBinaryManifestReleaseDate(
+        std::vector<unsigned char> const& manifestBytes,
+        std::wstring& releaseDate)
+    {
+        releaseDate = L"n/a";
+        if (manifestBytes.size() < 31)
+        {
+            return false;
+        }
+
+        BinaryReader reader(manifestBytes);
+        std::vector<unsigned char> magic;
+        if (!reader.ReadBytes(12, magic))
+        {
+            return false;
+        }
+
+        std::string magicString(magic.begin(), magic.end());
+        if (magicString != "MF-Churakov-")
+        {
+            return false;
+        }
+
+        unsigned short version = 0;
+        unsigned char exportType = 0;
+        long long generatedAtEpochMillis = 0;
+        if (!reader.ReadU16(version) || !reader.ReadU8(exportType) || !reader.ReadI64(generatedAtEpochMillis))
+        {
+            return false;
+        }
+
+        releaseDate = FormatEpochMillisAsUtc(generatedAtEpochMillis);
+        return true;
+    }
+
+    bool ParseBinaryDataPart(
+        std::vector<unsigned char> const& dataBytes,
+        AvBaseState& parsedState)
+    {
+        parsedState = {};
+        BinaryReader reader(dataBytes);
+
+        std::vector<unsigned char> magic;
+        if (!reader.ReadBytes(12, magic))
+        {
+            return false;
+        }
+        std::string magicString(magic.begin(), magic.end());
+        if (magicString != "DB-Churakov-")
+        {
+            return false;
+        }
+
+        unsigned short version = 0;
+        unsigned long recordsCount = 0;
+        if (!reader.ReadU16(version) || !reader.ReadU32(recordsCount))
+        {
+            return false;
+        }
+        (void)version;
+
+        for (unsigned long i = 0; i < recordsCount; ++i)
+        {
+            unsigned long threatNameLength = 0;
+            if (!reader.ReadU32(threatNameLength))
+            {
+                return false;
+            }
+            std::vector<unsigned char> threatNameBytes;
+            if (!reader.ReadBytes(static_cast<size_t>(threatNameLength), threatNameBytes))
+            {
+                return false;
+            }
+
+            unsigned long prefixLength = 0;
+            if (!reader.ReadU32(prefixLength) || prefixLength == 0)
+            {
+                return false;
+            }
+            std::vector<unsigned char> prefixBytes;
+            if (!reader.ReadBytes(static_cast<size_t>(prefixLength), prefixBytes))
+            {
+                return false;
+            }
+
+            unsigned long hashLength = 0;
+            if (!reader.ReadU32(hashLength) || hashLength == 0)
+            {
+                return false;
+            }
+            std::vector<unsigned char> remainderHash;
+            if (!reader.ReadBytes(static_cast<size_t>(hashLength), remainderHash))
+            {
+                return false;
+            }
+
+            long long remainderLength = 0;
+            if (!reader.ReadI64(remainderLength) || remainderLength < 0)
+            {
+                return false;
+            }
+
+            unsigned long fileTypeLength = 0;
+            if (!reader.ReadU32(fileTypeLength))
+            {
+                return false;
+            }
+            std::vector<unsigned char> fileTypeBytes;
+            if (!reader.ReadBytes(static_cast<size_t>(fileTypeLength), fileTypeBytes))
+            {
+                return false;
+            }
+
+            long long offsetStart = 0;
+            long long offsetEnd = 0;
+            if (!reader.ReadI64(offsetStart) || !reader.ReadI64(offsetEnd))
+            {
+                return false;
+            }
+
+            if (offsetEnd < offsetStart)
+            {
+                continue;
+            }
+
+            unsigned long long maxLen = (std::numeric_limits<unsigned long>::max)();
+            unsigned long long fullSignatureLength =
+                static_cast<unsigned long long>(prefixBytes.size()) + static_cast<unsigned long long>(remainderLength);
+            if (fullSignatureLength > maxLen)
+            {
+                continue;
+            }
+
+            AvSignatureRecord record{};
+            record.objectSignaturePrefixBytes = std::move(prefixBytes);
+            if (record.objectSignaturePrefixBytes.size() >= 8)
+            {
+                record.objectSignaturePrefix = ReadPrefixAsU64(record.objectSignaturePrefixBytes.data());
+            }
+            record.remainderLength = static_cast<unsigned long>(remainderLength);
+            record.objectSignatureLength = static_cast<unsigned long>(fullSignatureLength);
+            record.objectSignature = std::move(remainderHash);
+            record.offsetBegin = offsetStart;
+            record.offsetEnd = offsetEnd;
+            record.objectType = ParseObjectType(std::string(fileTypeBytes.begin(), fileTypeBytes.end()));
+            record.threatName = Utf8ToWide(std::string(threatNameBytes.begin(), threatNameBytes.end()));
+            if (record.threatName.empty())
+            {
+                record.threatName = L"UnknownThreat";
+            }
+
+            if (record.objectSignaturePrefixBytes.size() >= 8)
+            {
+                parsedState.recordsByPrefix[record.objectSignaturePrefix].push_back(std::move(record));
+            }
+            else
+            {
+                parsedState.shortPrefixRecordsByFirstByte[record.objectSignaturePrefixBytes.front()].push_back(std::move(record));
+            }
+            ++parsedState.recordsCount;
+        }
+
+        parsedState.loaded = true;
+        parsedState.loadedAt = std::chrono::system_clock::now();
+        if (parsedState.recordsCount == 0)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
     long LoadAvBaseFromServer(ApiUrlParts const& api, std::wstring const& accessToken, AvBaseState& avBaseState)
     {
-        HttpResult response = SendJsonRequest(api, L"GET", kApiUserSignaturesPath, "", accessToken);
+        HttpResult response = SendBinaryRequest(api, L"GET", kApiBinarySignaturesFullPath, accessToken);
         if (!response.ok)
         {
             return ZIVPO_RPC_STATUS_NETWORK_ERROR;
@@ -1369,32 +1982,31 @@ namespace
             return ZIVPO_RPC_STATUS_INTERNAL_ERROR;
         }
 
-        std::vector<std::string> jsonObjects = SplitJsonArrayObjects(response.body);
-        AvBaseState parsedState{};
-        std::string latestUpdatedAt;
-
-        for (auto const& jsonObject : jsonObjects)
+        std::optional<std::string> boundary = ExtractMultipartBoundary(response.contentType);
+        if (!boundary.has_value())
         {
-            AvSignatureRecord record{};
-            std::string updatedAt;
-            if (!ParseSignatureRecord(jsonObject, record, updatedAt))
-            {
-                continue;
-            }
-
-            parsedState.recordsByPrefix[record.objectSignaturePrefix].push_back(std::move(record));
-            ++parsedState.recordsCount;
-            if (!updatedAt.empty() && updatedAt > latestUpdatedAt)
-            {
-                latestUpdatedAt = std::move(updatedAt);
-            }
+            return ZIVPO_RPC_STATUS_INTERNAL_ERROR;
         }
 
-        parsedState.loaded = true;
-        parsedState.loadedAt = std::chrono::system_clock::now();
-        parsedState.releaseDate = latestUpdatedAt.empty()
-            ? L"n/a"
-            : Utf8ToWide(latestUpdatedAt);
+        MultipartParts parts{};
+        if (!ParseMultipartMixedParts(response.body, *boundary, parts))
+        {
+            return ZIVPO_RPC_STATUS_INTERNAL_ERROR;
+        }
+
+        AvBaseState parsedState{};
+        if (!ParseBinaryDataPart(parts.data, parsedState))
+        {
+            return ZIVPO_RPC_STATUS_INTERNAL_ERROR;
+        }
+
+        std::wstring releaseDate = L"n/a";
+        if (!parts.manifest.empty())
+        {
+            ParseBinaryManifestReleaseDate(parts.manifest, releaseDate);
+        }
+        parsedState.releaseDate = std::move(releaseDate);
+
         avBaseState = std::move(parsedState);
         return ZIVPO_RPC_STATUS_OK;
     }
@@ -1457,60 +2069,173 @@ namespace
         std::wstring& detectedThreat)
     {
         detectedThreat.clear();
-        if (bytes.size() < 8)
+        if (bytes.empty())
         {
             return false;
         }
 
-        std::vector<unsigned char> signatureBytes;
-        for (size_t position = 0; position + 8 <= bytes.size(); ++position)
+        auto tryMatchRecordAtPosition = [&](AvSignatureRecord const& record, size_t position) -> bool
         {
-            unsigned long long prefix = ReadPrefixAsU64(bytes.data() + position);
-            auto prefixIt = baseState.recordsByPrefix.find(prefix);
-            if (prefixIt == baseState.recordsByPrefix.end())
+            if (record.objectType != AvObjectType::Unknown && record.objectType != objectType)
             {
-                continue;
+                return false;
             }
 
-            auto const& records = prefixIt->second;
-            for (auto const& record : records)
+            long long const currentOffset = static_cast<long long>(position);
+            if (currentOffset < record.offsetBegin || currentOffset > record.offsetEnd)
             {
-                if (record.objectType != AvObjectType::Unknown && record.objectType != objectType)
-                {
-                    continue;
-                }
+                return false;
+            }
 
-                long long const currentOffset = static_cast<long long>(position);
-                if (currentOffset < record.offsetBegin || currentOffset > record.offsetEnd)
-                {
-                    continue;
-                }
+            size_t const prefixLength = record.objectSignaturePrefixBytes.size();
+            if (prefixLength == 0 || position + prefixLength > bytes.size())
+            {
+                return false;
+            }
 
-                if (record.objectSignatureLength < 8)
-                {
-                    continue;
-                }
+            if (!std::equal(
+                record.objectSignaturePrefixBytes.begin(),
+                record.objectSignaturePrefixBytes.end(),
+                bytes.begin() + static_cast<std::ptrdiff_t>(position)))
+            {
+                return false;
+            }
 
-                size_t const signatureLength = static_cast<size_t>(record.objectSignatureLength);
-                if (position + signatureLength > bytes.size())
-                {
-                    continue;
-                }
+            size_t remainderLength = static_cast<size_t>(record.remainderLength);
+            if (position + prefixLength + remainderLength > bytes.size())
+            {
+                return false;
+            }
 
-                signatureBytes.assign(
-                    bytes.begin() + static_cast<std::ptrdiff_t>(position),
-                    bytes.begin() + static_cast<std::ptrdiff_t>(position + signatureLength));
+            std::vector<unsigned char> remainderBytes;
+            remainderBytes.assign(
+                bytes.begin() + static_cast<std::ptrdiff_t>(position + prefixLength),
+                bytes.begin() + static_cast<std::ptrdiff_t>(position + prefixLength + remainderLength));
 
-                std::vector<unsigned char> computedHash;
-                if (!ComputeSha256(signatureBytes, computedHash))
+            std::vector<unsigned char> fullSignatureBytes;
+            fullSignatureBytes.assign(
+                bytes.begin() + static_cast<std::ptrdiff_t>(position),
+                bytes.begin() + static_cast<std::ptrdiff_t>(position + prefixLength + remainderLength));
+
+            auto matchDetected = [&]()
+            {
+                detectedThreat = record.threatName.empty() ? L"Malware signature" : record.threatName;
+                return true;
+            };
+
+            if (record.objectSignature == remainderBytes || record.objectSignature == fullSignatureBytes)
+            {
+                return matchDetected();
+            }
+
+            std::vector<unsigned char> computedHash;
+            auto hashAndCompare = [&](wchar_t const* algorithm, std::vector<unsigned char> const& input) -> bool
+            {
+                if (!ComputeHash(algorithm, input, computedHash))
                 {
-                    continue;
+                    return false;
                 }
 
                 if (computedHash == record.objectSignature)
                 {
-                    detectedThreat = record.threatName.empty() ? L"Malware signature" : record.threatName;
                     return true;
+                }
+
+                if (!record.objectSignature.empty() &&
+                    record.objectSignature.size() < computedHash.size() &&
+                    std::equal(
+                        record.objectSignature.begin(),
+                        record.objectSignature.end(),
+                        computedHash.begin()))
+                {
+                    return true;
+                }
+
+                return false;
+            };
+
+            auto hashMatchesByLength = [&](std::vector<unsigned char> const& input) -> bool
+            {
+                size_t const signatureLen = record.objectSignature.size();
+                if (signatureLen == 16)
+                {
+                    return hashAndCompare(BCRYPT_MD5_ALGORITHM, input);
+                }
+                if (signatureLen == 20)
+                {
+                    return hashAndCompare(BCRYPT_SHA1_ALGORITHM, input);
+                }
+
+                // Default and fallback path.
+                return hashAndCompare(BCRYPT_SHA256_ALGORITHM, input);
+            };
+
+            // Primary backend path: remainder hash.
+            if (hashMatchesByLength(remainderBytes))
+            {
+                return matchDetected();
+            }
+
+            // Compatibility path: hash over full signature bytes.
+            if (hashMatchesByLength(fullSignatureBytes))
+            {
+                return matchDetected();
+            }
+
+            return false;
+        };
+
+        for (size_t position = 0; position + 8 <= bytes.size(); ++position)
+        {
+            unsigned long long prefix = ReadPrefixAsU64(bytes.data() + position);
+            auto prefixIt = baseState.recordsByPrefix.find(prefix);
+            if (prefixIt != baseState.recordsByPrefix.end())
+            {
+                auto const& records = prefixIt->second;
+                for (auto const& record : records)
+                {
+                    if (tryMatchRecordAtPosition(record, position))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            unsigned int const firstByte = bytes[position];
+            auto shortPrefixIt = baseState.shortPrefixRecordsByFirstByte.find(firstByte);
+            if (shortPrefixIt == baseState.shortPrefixRecordsByFirstByte.end())
+            {
+                continue;
+            }
+
+            for (auto const& record : shortPrefixIt->second)
+            {
+                if (tryMatchRecordAtPosition(record, position))
+                {
+                    return true;
+                }
+            }
+        }
+
+        // Also scan tail where less than 8 bytes remain (needed for short prefixes).
+        if (!baseState.shortPrefixRecordsByFirstByte.empty())
+        {
+            size_t const startTail = bytes.size() >= 8 ? bytes.size() - 7 : 0;
+            for (size_t position = startTail; position < bytes.size(); ++position)
+            {
+                unsigned int const firstByte = bytes[position];
+                auto shortPrefixIt = baseState.shortPrefixRecordsByFirstByte.find(firstByte);
+                if (shortPrefixIt == baseState.shortPrefixRecordsByFirstByte.end())
+                {
+                    continue;
+                }
+
+                for (auto const& record : shortPrefixIt->second)
+                {
+                    if (tryMatchRecordAtPosition(record, position))
+                    {
+                        return true;
+                    }
                 }
             }
         }
