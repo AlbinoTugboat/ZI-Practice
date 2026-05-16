@@ -135,6 +135,12 @@ if(NOT EXISTS "${MIDL_EXE}")
     message(FATAL_ERROR "midl.exe was not found: ${MIDL_EXE}")
 endif()
 
+set(WINSDK_CPPWINRT_EXE "${WINSDK_BIN_VERSION_DIR}/${MIDL_ENV}/cppwinrt.exe")
+if(EXISTS "${WINSDK_CPPWINRT_EXE}")
+    set(CPPWINRT_EXE "${WINSDK_CPPWINRT_EXE}")
+    message(STATUS "Using Windows SDK cppwinrt.exe: ${CPPWINRT_EXE}")
+endif()
+
 set(FOUNDATION_LIB_DIR "${FOUNDATION_DIR}/lib/native/${ZIVPO_PLATFORM_LOWER}")
 set(DWRITE_LIB_DIR "${DWRITE_DIR}/lib/native/${ZIVPO_PLATFORM_LOWER}")
 set(INTERACTIVE_LIB_DIR "${INTERACTIVE_DIR}/lib/native/win10-${ZIVPO_PLATFORM_LOWER}")
@@ -356,23 +362,10 @@ set_target_properties(zivpo_service PROPERTIES
     VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:zivpo_service>"
 )
 
-set(ZIVPO_RUNTIME_MSIX_ARCH "win10-x64")
-if(ZIVPO_PLATFORM_LOWER STREQUAL "x86")
-    set(ZIVPO_RUNTIME_MSIX_ARCH "win10-x86")
-elseif(ZIVPO_PLATFORM_LOWER STREQUAL "arm64")
-    set(ZIVPO_RUNTIME_MSIX_ARCH "win10-arm64")
-endif()
-
 set(ZIVPO_WEBVIEW2_LOADER_DLL "${WEBVIEW2_DIR}/build/native/${ZIVPO_PLATFORM_LOWER}/WebView2Loader.dll")
 if(NOT EXISTS "${ZIVPO_WEBVIEW2_LOADER_DLL}")
     message(FATAL_ERROR "WebView2Loader.dll was not found: ${ZIVPO_WEBVIEW2_LOADER_DLL}")
 endif()
-
-set(ZIVPO_RUNTIME_MSIX_SOURCE_DIR "${RUNTIME_DIR}/tools/MSIX/${ZIVPO_RUNTIME_MSIX_ARCH}")
-if(NOT EXISTS "${ZIVPO_RUNTIME_MSIX_SOURCE_DIR}")
-    message(FATAL_ERROR "Windows App Runtime MSIX directory was not found: ${ZIVPO_RUNTIME_MSIX_SOURCE_DIR}")
-endif()
-
 install(TARGETS zivpo zivpo_service
     RUNTIME DESTINATION .
 )
@@ -383,23 +376,31 @@ install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Install-WindowsAppRuntime-CurrentUser.ps1"
     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Install-ZIVPO.ps1"
     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Uninstall-ZIVPO.ps1"
+    "${ZIVPO_MSI_CONFIGURE_SCRIPT}"
+    "${ZIVPO_MSI_UNCONFIGURE_SCRIPT}"
     DESTINATION .
 )
 
-install(DIRECTORY "${ZIVPO_RUNTIME_MSIX_SOURCE_DIR}/"
-    DESTINATION "RuntimeMsix"
-    FILES_MATCHING
-    PATTERN "*.msix"
+install(FILES ${ZIVPO_RUNTIME_MSIX_FILES}
+    DESTINATION RuntimeMsix
 )
 
 set(CPACK_GENERATOR "WIX")
 set(CPACK_PACKAGE_NAME "ZIVPO")
 set(CPACK_PACKAGE_VENDOR "ZIVPO")
-set(CPACK_PACKAGE_VERSION "1.0.0")
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "ZIVPO")
+if(DEFINED PROJECT_VERSION AND NOT PROJECT_VERSION STREQUAL "")
+    set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+else()
+    set(CPACK_PACKAGE_VERSION "1.0.0")
+endif()
+
+# Keep this GUID stable across releases so upgrades replace previous installs.
 set(CPACK_WIX_UPGRADE_GUID "A2E1A9DB-41A8-4B3D-9F2B-7D0E3A93D5E6")
+set(CPACK_WIX_VERSION 3)
 set(CPACK_WIX_INSTALL_SCOPE "perMachine")
-set(CPACK_WIX_UI_REF "WixUI_InstallDir")
 set(CPACK_WIX_EXTENSIONS "WixUtilExtension")
-set(CPACK_WIX_PATCH_FILE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/WixPatch.cpack.wxs")
+set(CPACK_WIX_PATCH_FILE "${ZIVPO_MSI_WIX_PATCH_FILE}")
+set(CPACK_WIX_UI_REF "WixUI_InstallDir")
+
 include(CPack)
