@@ -13,6 +13,12 @@ include(GNUInstallDirs)
 
 option(ZIVPO_ENABLE_NUGET_RESTORE "Restore packages from packages.config during CMake configure" ON)
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(CPACK_WIX_ARCHITECTURE "x64")
+else()
+    set(CPACK_WIX_ARCHITECTURE "x86")
+endif()
+
 set(ZIVPO_PACKAGES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/packages")
 set(ZIVPO_PACKAGES_CONFIG "${CMAKE_CURRENT_SOURCE_DIR}/packages.config")
 
@@ -114,12 +120,15 @@ endif()
 if(ZIVPO_PLATFORM_LOWER STREQUAL "x86")
     set(MIDL_ENV "win32")
     set(MIDL_EXE "${WINSDK_BIN_VERSION_DIR}/x86/midl.exe")
+    set(ZIVPO_RUNTIME_ARCH "win10-x86")
 elseif(ZIVPO_PLATFORM_LOWER STREQUAL "arm64")
     set(MIDL_ENV "arm64")
     set(MIDL_EXE "${WINSDK_BIN_VERSION_DIR}/arm64/midl.exe")
+    set(ZIVPO_RUNTIME_ARCH "win10-arm64")
 else()
     set(MIDL_ENV "x64")
     set(MIDL_EXE "${WINSDK_BIN_VERSION_DIR}/x64/midl.exe")
+    set(ZIVPO_RUNTIME_ARCH "win10-x64")
 endif()
 
 if(NOT EXISTS "${MIDL_EXE}")
@@ -139,6 +148,10 @@ set(RPC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/rpc")
 set(RPC_HEADER "${RPC_GENERATED_DIR}/ServiceRpc.h")
 set(RPC_CLIENT_STUB "${RPC_GENERATED_DIR}/ServiceRpcClient.c")
 set(RPC_SERVER_STUB "${RPC_GENERATED_DIR}/ServiceRpcServer.c")
+set(ZIVPO_MSI_WIX_PATCH_FILE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/WixPatch.cpack.wxs")
+set(ZIVPO_MSI_CONFIGURE_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Configure-Installed-ZIVPO.ps1")
+set(ZIVPO_MSI_UNCONFIGURE_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Unconfigure-Installed-ZIVPO.ps1")
+set(ZIVPO_RUNTIME_MSIX_DIR "${RUNTIME_DIR}/tools/MSIX/${ZIVPO_RUNTIME_ARCH}")
 
 set(INTERACTIVE_METADATA_DIR "${INTERACTIVE_DIR}/metadata")
 file(GLOB INTERACTIVE_METADATA_VERSION_DIRS LIST_DIRECTORIES true "${INTERACTIVE_DIR}/metadata/10.*")
@@ -153,11 +166,20 @@ foreach(required_path
     "${FOUNDATION_LIB_DIR}/mrm.lib"
     "${INTERACTIVE_LIB_DIR}/Microsoft.UI.Dispatching.lib"
     "${DWRITE_LIB_DIR}/DWriteCore.lib"
-    "${BOOTSTRAP_DLL}")
+    "${BOOTSTRAP_DLL}"
+    "${ZIVPO_MSI_WIX_PATCH_FILE}"
+    "${ZIVPO_MSI_CONFIGURE_SCRIPT}"
+    "${ZIVPO_MSI_UNCONFIGURE_SCRIPT}")
     if(NOT EXISTS "${required_path}")
         message(FATAL_ERROR "Required dependency file was not found: ${required_path}")
     endif()
 endforeach()
+
+file(GLOB ZIVPO_RUNTIME_MSIX_FILES "${ZIVPO_RUNTIME_MSIX_DIR}/Microsoft.WindowsAppRuntime*.msix")
+list(LENGTH ZIVPO_RUNTIME_MSIX_FILES ZIVPO_RUNTIME_MSIX_COUNT)
+if(ZIVPO_RUNTIME_MSIX_COUNT LESS 4)
+    message(FATAL_ERROR "Windows App Runtime MSIX files were not found in ${ZIVPO_RUNTIME_MSIX_DIR}")
+endif()
 
 file(GLOB FOUNDATION_WINMD "${FOUNDATION_DIR}/metadata/*.winmd")
 file(GLOB WINUI_WINMD "${WINUI_DIR}/metadata/*.winmd")

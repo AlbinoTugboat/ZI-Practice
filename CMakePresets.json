@@ -36,6 +36,14 @@
       "name": "build-release",
       "configurePreset": "vs2022-x64",
       "configuration": "Release"
+    },
+    {
+      "name": "package-release-vs2026",
+      "configurePreset": "vs2026-x64",
+      "configuration": "Release",
+      "targets": [
+        "package"
+      ]
     }
   ]
 }

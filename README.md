@@ -49,6 +49,44 @@ Release:
 cmake --build --preset build-release
 ```
 
+## MSI installer (CMake/CPack)
+
+Prerequisite (one-time on build machine):
+
+- Install WiX Toolset v3 and add `candle.exe` / `light.exe` to `PATH`
+  (or set `WIX` env var to WiX root folder).
+
+Build and package MSI:
+
+```powershell
+cmake --preset vs2026-x64
+cmake --build --preset build-release-vs2026 --target package
+```
+
+Or with preset:
+
+```powershell
+cmake --build --preset package-release-vs2026
+```
+
+Result:
+
+- `out/build/vs2026-x64/ZIVPO-<version>-win64.msi` (file name may vary by CPack settings).
+
+What MSI does:
+
+- installs `ZIVPO.exe` and `ZIVPO.Service.exe` into `Program Files\ZIVPO`;
+- installs Windows App Runtime MSIX packages into `RuntimeMsix`;
+- runs post-install configuration to provision runtime, register/configure service and start it;
+- runs uninstall configuration to stop/remove service during MSI uninstall.
+
+Installer UX note:
+
+- `.msi` files usually do not show "Run as administrator" in Explorer context menu.
+- Start installer by double-click; Windows Installer will request UAC elevation automatically.
+- If post-install configuration has runtime-related warnings, details are written to:
+  `C:\ProgramData\ZIVPO\msi-postinstall.log`
+
 ## Запуск
 
 Файл приложения после CMake-сборки:

@@ -20,6 +20,21 @@ jobs:
       - name: Setup NuGet
         uses: NuGet/setup-nuget@v2
 
+      - name: Setup WiX v3 (portable)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $toolsDir = "$env:GITHUB_WORKSPACE\.tools\wix314"
+          $zipPath = "$toolsDir\wix314-binaries.zip"
+          $wixDir = "$toolsDir\bin"
+          New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip" -OutFile $zipPath
+          if (Test-Path $wixDir) { Remove-Item -LiteralPath $wixDir -Recurse -Force }
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $wixDir -Force
+          if (-not (Test-Path "$wixDir\candle.exe")) { throw "candle.exe is missing in WiX portable folder" }
+          if (-not (Test-Path "$wixDir\light.exe")) { throw "light.exe is missing in WiX portable folder" }
+          "WIX=$wixDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Configure (CMake)
         run: cmake --preset vs2022-x64
 
@@ -28,6 +43,9 @@ jobs:
 
       - name: Build Release (CMake)
         run: cmake --build --preset build-release
+
+      - name: Build MSI installer (CPack/WiX)
+        run: cmake --build --preset build-release --target package
 
       - name: Verify expected binaries
         shell: pwsh
@@ -39,6 +57,15 @@ jobs:
           $releaseDir = "out/build/vs2022-x64/Release"
           if (-not (Test-Path "$releaseDir/ZIVPO.exe")) { throw "Missing ZIVPO.exe (Release)" }
           if (-not (Test-Path "$releaseDir/ZIVPO.Service.exe")) { throw "Missing ZIVPO.Service.exe (Release)" }
+
+      - name: Verify MSI artifact
+        shell: pwsh
+        run: |
+          $msiFiles = Get-ChildItem -Path "out/build/vs2022-x64" -Filter "*.msi" -File -ErrorAction SilentlyContinue
+          if ($null -eq $msiFiles -or $msiFiles.Count -eq 0) {
+            throw "MSI package was not generated."
+          }
+          $msiFiles | ForEach-Object { Write-Host "MSI: $($_.FullName)" }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -57,3 +84,9 @@ jobs:
             out/build/vs2022-x64/Release/ZIVPO.exe
             out/build/vs2022-x64/Release/ZIVPO.Service.exe
             out/build/vs2022-x64/Release/Microsoft.WindowsAppRuntime.Bootstrap.dll
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zivpo-msi-vs2022-x64
+          path: out/build/vs2022-x64/*.msi
