@@ -24,9 +24,6 @@ namespace winrt::ZIVPO::implementation
     {
         App* g_appInstance = nullptr;
         constexpr wchar_t kSingleInstanceMutexPrefix[] = L"Local\\ZIVPO.SingleInstance.";
-        constexpr wchar_t kAppInstancePropertyName[] = L"ZIVPO.App.Instance";
-        constexpr UINT_PTR kMainMenuFileId = 3001;
-        constexpr UINT_PTR kMainMenuExitId = 3002;
         constexpr std::wstring_view kHiddenSwitches[] = {
             L"--hidden",
             L"--background",
@@ -143,6 +140,10 @@ namespace winrt::ZIVPO::implementation
                 return L"Activation failed. Check activation key.";
             case ::ZIVPO::Service::RpcStatusCode::NetworkError:
                 return L"Network error or service is unavailable.";
+            case ::ZIVPO::Service::RpcStatusCode::InvalidArgument:
+                return L"Invalid input data.";
+            case ::ZIVPO::Service::RpcStatusCode::ScanFailed:
+                return L"Scan operation failed.";
             default:
                 return L"Internal service error.";
             }
@@ -428,8 +429,7 @@ namespace winrt::ZIVPO::implementation
         {
             TraceMessage(L"App::App: failed to load App.xaml resources.");
         }
-        RequestedTheme(ApplicationTheme::Light);
-        TraceMessage(L"App::App requested theme set");
+        TraceMessage(L"App::App theme left as system default");
 
         // Xaml objects should not call InitializeComponent during construction.
         // See https://github.com/microsoft/cppwinrt/tree/master/nuget#initializecomponent
@@ -483,17 +483,6 @@ namespace winrt::ZIVPO::implementation
             }
             m_windowClosedHandlerAttached = false;
         }
-
-        if (m_mainWindowHwnd != nullptr && m_originalMainWindowProc != nullptr && IsWindow(m_mainWindowHwnd))
-        {
-            SetWindowLongPtrW(
-                m_mainWindowHwnd,
-                GWLP_WNDPROC,
-                reinterpret_cast<LONG_PTR>(m_originalMainWindowProc));
-            RemovePropW(m_mainWindowHwnd, kAppInstancePropertyName);
-        }
-        m_mainWindowHwnd = nullptr;
-        m_originalMainWindowProc = nullptr;
 
         if (m_singleInstanceMutex != nullptr)
         {
@@ -649,8 +638,6 @@ namespace winrt::ZIVPO::implementation
                 ResetUiElementHandles();
                 m_window = nullptr;
             }
-            m_mainWindowHwnd = nullptr;
-            m_originalMainWindowProc = nullptr;
             m_windowClosedHandlerAttached = false;
         });
         m_windowClosedHandlerAttached = true;
@@ -661,7 +648,13 @@ namespace winrt::ZIVPO::implementation
         m_userStatusText = nullptr;
         m_licenseStatusText = nullptr;
         m_antivirusStatusText = nullptr;
+        m_avBaseInfoText = nullptr;
+        m_scanResultText = nullptr;
+        m_scanFilePathInput = nullptr;
+        m_scanDirectoryPathInput = nullptr;
         m_antivirusActionButton = nullptr;
+        m_scanFileButton = nullptr;
+        m_scanDirectoryButton = nullptr;
         m_logoutButton = nullptr;
         m_authPanel = nullptr;
         m_usernameInput = nullptr;
@@ -680,7 +673,6 @@ namespace winrt::ZIVPO::implementation
         auto root = StackPanel{};
         root.Spacing(8);
         root.Padding(Thickness{ 12, 12, 12, 12 });
-        root.RequestedTheme(ElementTheme::Light);
 
         if (minimalProbeEnabled)
         {
@@ -692,6 +684,21 @@ namespace winrt::ZIVPO::implementation
             TraceMessage(L"BuildMainUi end");
             return;
         }
+
+        auto mainMenuRow = StackPanel{};
+        mainMenuRow.Orientation(Orientation::Horizontal);
+        mainMenuRow.Spacing(8);
+
+        auto fileMenuLabel = TextBlock{};
+        fileMenuLabel.Text(L"\x0424\x0430\x0439\x043B:");
+        mainMenuRow.Children().Append(fileMenuLabel);
+
+        auto exitMenuButton = Button{};
+        exitMenuButton.Content(box_value(L"\x0412\x044B\x0445\x043E\x0434"));
+        exitMenuButton.Click({ this, &App::OnMainMenuExitClick });
+        mainMenuRow.Children().Append(exitMenuButton);
+
+        root.Children().Append(mainMenuRow);
 
         auto content = StackPanel{};
         content.Spacing(10);
@@ -706,10 +713,42 @@ namespace winrt::ZIVPO::implementation
         m_antivirusStatusText = TextBlock{};
         content.Children().Append(m_antivirusStatusText);
 
+        m_avBaseInfoText = TextBlock{};
+        m_avBaseInfoText.TextWrapping(TextWrapping::Wrap);
+        content.Children().Append(m_avBaseInfoText);
+
         m_antivirusActionButton = Button{};
-        m_antivirusActionButton.Content(box_value(L"Run Scan (demo)"));
+        m_antivirusActionButton.Content(box_value(L"Refresh state"));
         m_antivirusActionButton.IsEnabled(false);
+        m_antivirusActionButton.Click([this](auto const&, auto const&)
+        {
+            RefreshStateFromService(false);
+        });
         content.Children().Append(m_antivirusActionButton);
+
+        auto scanFileHeader = TextBlock{};
+        scanFileHeader.Text(L"Scan file (path will be requested):");
+        content.Children().Append(scanFileHeader);
+
+        m_scanFileButton = Button{};
+        m_scanFileButton.Content(box_value(L"Scan file"));
+        m_scanFileButton.IsEnabled(false);
+        m_scanFileButton.Click({ this, &App::OnScanFileClick });
+        content.Children().Append(m_scanFileButton);
+
+        auto scanDirectoryHeader = TextBlock{};
+        scanDirectoryHeader.Text(L"Scan folder (path will be requested):");
+        content.Children().Append(scanDirectoryHeader);
+
+        m_scanDirectoryButton = Button{};
+        m_scanDirectoryButton.Content(box_value(L"Scan folder"));
+        m_scanDirectoryButton.IsEnabled(false);
+        m_scanDirectoryButton.Click({ this, &App::OnScanDirectoryClick });
+        content.Children().Append(m_scanDirectoryButton);
+
+        m_scanResultText = TextBlock{};
+        m_scanResultText.TextWrapping(TextWrapping::Wrap);
+        content.Children().Append(m_scanResultText);
 
         m_logoutButton = Button{};
         m_logoutButton.Content(box_value(L"Log Out"));
@@ -772,17 +811,16 @@ namespace winrt::ZIVPO::implementation
 
         TraceMessage(L"EnsureUiInitialized: creating window and building UI");
         EnsureWindowCreated();
+        BuildMainUi();
         try
         {
             m_window.Activate();
-            TraceMessage(L"EnsureUiInitialized: window activated before BuildMainUi");
+            TraceMessage(L"EnsureUiInitialized: window activated after BuildMainUi");
         }
         catch (...)
         {
-            TraceMessage(L"EnsureUiInitialized: m_window.Activate failed before BuildMainUi");
+            TraceMessage(L"EnsureUiInitialized: m_window.Activate failed after BuildMainUi");
         }
-        BuildMainUi();
-        EnsureMainWindowHooked();
         m_uiInitialized = true;
         TraceMessage(L"EnsureUiInitialized: completed");
     }
@@ -918,6 +956,138 @@ namespace winrt::ZIVPO::implementation
         UpdateUiState();
     }
 
+    void App::OnScanFileClick(IInspectable const& /*sender*/, RoutedEventArgs const& /*args*/)
+    {
+        if (m_scanResultText == nullptr)
+        {
+            return;
+        }
+
+        if (!m_authenticated || !m_hasLicense || m_licenseBlocked)
+        {
+            m_scanResultText.Text(L"Scan is unavailable. Sign in and activate license first.");
+            return;
+        }
+
+        std::wstring filePath;
+        std::wstring unusedPassword;
+        hstring promptError;
+        if (!PromptForCredentials(
+            MainWindowHandle(),
+            L"File Scan",
+            L"Enter full file path in username field.",
+            false,
+            filePath,
+            unusedPassword,
+            promptError))
+        {
+            if (!promptError.empty())
+            {
+                m_scanResultText.Text(promptError);
+            }
+            return;
+        }
+
+        if (filePath.empty())
+        {
+            m_scanResultText.Text(L"File path is empty.");
+            return;
+        }
+
+        ::ZIVPO::Service::ScanResult scanResult{};
+        ::ZIVPO::Service::RpcCallResult result = ::ZIVPO::Service::ScanFile(filePath, scanResult);
+        if (!result.ok)
+        {
+            std::wstring text = BuildRpcErrorText(result.status).c_str();
+            if (!scanResult.details.empty())
+            {
+                text.append(L" ");
+                text.append(scanResult.details);
+            }
+            m_scanResultText.Text(hstring(text));
+            return;
+        }
+
+        std::wstring text = L"File scan completed: ";
+        text.append(scanResult.malicious ? L"threat detected" : L"no threats");
+        text.append(L". Scanned objects: ");
+        text.append(std::to_wstring(scanResult.scannedObjects));
+        text.append(L", infected: ");
+        text.append(std::to_wstring(scanResult.infectedObjects));
+        if (!scanResult.detectedThreat.empty())
+        {
+            text.append(L". Threat: ");
+            text.append(scanResult.detectedThreat);
+        }
+        m_scanResultText.Text(hstring(text));
+    }
+
+    void App::OnScanDirectoryClick(IInspectable const& /*sender*/, RoutedEventArgs const& /*args*/)
+    {
+        if (m_scanResultText == nullptr)
+        {
+            return;
+        }
+
+        if (!m_authenticated || !m_hasLicense || m_licenseBlocked)
+        {
+            m_scanResultText.Text(L"Scan is unavailable. Sign in and activate license first.");
+            return;
+        }
+
+        std::wstring directoryPath;
+        std::wstring unusedPassword;
+        hstring promptError;
+        if (!PromptForCredentials(
+            MainWindowHandle(),
+            L"Folder Scan",
+            L"Enter full folder path in username field.",
+            false,
+            directoryPath,
+            unusedPassword,
+            promptError))
+        {
+            if (!promptError.empty())
+            {
+                m_scanResultText.Text(promptError);
+            }
+            return;
+        }
+
+        if (directoryPath.empty())
+        {
+            m_scanResultText.Text(L"Folder path is empty.");
+            return;
+        }
+
+        ::ZIVPO::Service::ScanResult scanResult{};
+        ::ZIVPO::Service::RpcCallResult result = ::ZIVPO::Service::ScanDirectory(directoryPath, scanResult);
+        if (!result.ok)
+        {
+            std::wstring text = BuildRpcErrorText(result.status).c_str();
+            if (!scanResult.details.empty())
+            {
+                text.append(L" ");
+                text.append(scanResult.details);
+            }
+            m_scanResultText.Text(hstring(text));
+            return;
+        }
+
+        std::wstring text = L"Folder scan completed: ";
+        text.append(scanResult.malicious ? L"threats detected" : L"no threats");
+        text.append(L". Scanned objects: ");
+        text.append(std::to_wstring(scanResult.scannedObjects));
+        text.append(L", infected: ");
+        text.append(std::to_wstring(scanResult.infectedObjects));
+        if (!scanResult.detectedThreat.empty())
+        {
+            text.append(L". First threat: ");
+            text.append(scanResult.detectedThreat);
+        }
+        m_scanResultText.Text(hstring(text));
+    }
+
     void App::RefreshStateFromService(bool showErrors)
     {
         TraceMessage(L"RefreshStateFromService begin");
@@ -999,6 +1169,14 @@ namespace winrt::ZIVPO::implementation
         }
 
         m_antivirusActionButton.IsEnabled(enabled);
+        if (m_scanFileButton != nullptr)
+        {
+            m_scanFileButton.IsEnabled(enabled);
+        }
+        if (m_scanDirectoryButton != nullptr)
+        {
+            m_scanDirectoryButton.IsEnabled(enabled);
+        }
         m_antivirusStatusText.Text(enabled ? L"Antivirus: enabled" : L"Antivirus: disabled");
     }
 
@@ -1008,6 +1186,7 @@ namespace winrt::ZIVPO::implementation
         if (!m_uiInitialized ||
             m_userStatusText == nullptr ||
             m_licenseStatusText == nullptr ||
+            m_avBaseInfoText == nullptr ||
             m_authPanel == nullptr ||
             m_activationPanel == nullptr ||
             m_logoutButton == nullptr)
@@ -1020,10 +1199,15 @@ namespace winrt::ZIVPO::implementation
         {
             m_userStatusText.Text(L"User: not authenticated");
             m_licenseStatusText.Text(L"License: missing");
+            m_avBaseInfoText.Text(L"AV base: unavailable");
             m_authPanel.Visibility(Visibility::Visible);
             m_activationPanel.Visibility(Visibility::Collapsed);
             m_logoutButton.Visibility(Visibility::Collapsed);
             SetAntivirusEnabled(false);
+            if (m_scanResultText != nullptr)
+            {
+                m_scanResultText.Text(L"");
+            }
             TraceMessage(L"UpdateUiState end (unauthenticated)");
             return;
         }
@@ -1037,6 +1221,7 @@ namespace winrt::ZIVPO::implementation
         if (!m_hasLicense)
         {
             m_licenseStatusText.Text(L"License: missing, activation required");
+            m_avBaseInfoText.Text(L"AV base: unavailable");
             m_activationPanel.Visibility(Visibility::Visible);
             SetAntivirusEnabled(false);
             TraceMessage(L"UpdateUiState end (no license)");
@@ -1053,6 +1238,22 @@ namespace winrt::ZIVPO::implementation
         m_licenseStatusText.Text(hstring(licenseLine));
         m_activationPanel.Visibility(Visibility::Collapsed);
         SetAntivirusEnabled(!m_licenseBlocked);
+
+        ::ZIVPO::Service::AvBaseInfo avBaseInfo{};
+        ::ZIVPO::Service::RpcCallResult avBaseResult = ::ZIVPO::Service::GetAvBaseInfo(avBaseInfo);
+        if (avBaseResult.ok && avBaseInfo.loaded)
+        {
+            std::wstring avLine = L"AV base release: ";
+            avLine.append(avBaseInfo.releaseDate.empty() ? L"(unknown)" : avBaseInfo.releaseDate);
+            avLine.append(L", records: ");
+            avLine.append(std::to_wstring(avBaseInfo.recordsCount));
+            m_avBaseInfoText.Text(hstring(avLine));
+        }
+        else
+        {
+            m_avBaseInfoText.Text(L"AV base: unavailable");
+        }
+
         TraceMessage(L"UpdateUiState end (licensed)");
     }
 
@@ -1067,7 +1268,24 @@ namespace winrt::ZIVPO::implementation
         m_licensePollTimer.Interval(std::chrono::seconds(15));
         m_licensePollTimer.Tick([this](auto const&, auto const&)
         {
-            RefreshStateFromService(false);
+            try
+            {
+                RefreshStateFromService(false);
+            }
+            catch (winrt::hresult_error const& ex)
+            {
+                std::wstring message = L"License poll refresh failed with HRESULT 0x";
+                wchar_t hrBuffer[16]{};
+                StringCchPrintfW(hrBuffer, ARRAYSIZE(hrBuffer), L"%08X", static_cast<unsigned int>(ex.code().value));
+                message.append(hrBuffer);
+                message.append(L": ");
+                message.append(ex.message().c_str());
+                TraceMessage(message);
+            }
+            catch (...)
+            {
+                TraceMessage(L"License poll refresh failed with unknown exception.");
+            }
         });
         m_licensePollTimer.Start();
     }
@@ -1093,7 +1311,24 @@ namespace winrt::ZIVPO::implementation
         bool const enqueued = m_uiDispatcherQueue.TryEnqueue([action = std::move(action)]
         {
             TraceMessage(L"RunOnUiThread callback begin");
-            action();
+            try
+            {
+                action();
+            }
+            catch (winrt::hresult_error const& ex)
+            {
+                std::wstring message = L"RunOnUiThread callback failed with HRESULT 0x";
+                wchar_t hrBuffer[16]{};
+                StringCchPrintfW(hrBuffer, ARRAYSIZE(hrBuffer), L"%08X", static_cast<unsigned int>(ex.code().value));
+                message.append(hrBuffer);
+                message.append(L": ");
+                message.append(ex.message().c_str());
+                TraceMessage(message);
+            }
+            catch (...)
+            {
+                TraceMessage(L"RunOnUiThread callback failed with unknown exception.");
+            }
             TraceMessage(L"RunOnUiThread callback end");
         });
 
@@ -1132,60 +1367,6 @@ namespace winrt::ZIVPO::implementation
         return hwnd;
     }
 
-    void App::EnsureMainWindowHooked()
-    {
-        if (m_mainWindowHwnd != nullptr)
-        {
-            return;
-        }
-
-        m_mainWindowHwnd = MainWindowHandle();
-        if (m_mainWindowHwnd == nullptr)
-        {
-            return;
-        }
-
-        SetPropW(m_mainWindowHwnd, kAppInstancePropertyName, this);
-        m_originalMainWindowProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
-            m_mainWindowHwnd,
-            GWLP_WNDPROC,
-            reinterpret_cast<LONG_PTR>(&App::MainWindowProc)));
-        EnsureMainWindowMenu();
-    }
-
-    void App::EnsureMainWindowMenu()
-    {
-        if (m_mainWindowHwnd == nullptr)
-        {
-            return;
-        }
-
-        if (GetMenu(m_mainWindowHwnd) != nullptr)
-        {
-            return;
-        }
-
-        HMENU mainMenu = CreateMenu();
-        HMENU fileSubMenu = CreatePopupMenu();
-        if (mainMenu == nullptr || fileSubMenu == nullptr)
-        {
-            if (fileSubMenu != nullptr)
-            {
-                DestroyMenu(fileSubMenu);
-            }
-            if (mainMenu != nullptr)
-            {
-                DestroyMenu(mainMenu);
-            }
-            return;
-        }
-
-        AppendMenuW(fileSubMenu, MF_STRING, kMainMenuExitId, L"\x0412\x044B\x0445\x043E\x0434");
-        AppendMenuW(mainMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(fileSubMenu), L"\x0424\x0430\x0439\x043B");
-        SetMenu(m_mainWindowHwnd, mainMenu);
-        DrawMenuBar(m_mainWindowHwnd);
-    }
-
     void App::ShowMainWindow()
     {
         TraceMessage(L"ShowMainWindow begin");
@@ -1220,11 +1401,14 @@ namespace winrt::ZIVPO::implementation
         {
             SetForegroundWindow(hwnd);
             m_mainWindowVisible = true;
-            RunOnUiThread([this]
+            if (!IsEnvironmentFlagEnabled(L"ZIVPO_SKIP_STARTUP_REFRESH"))
             {
-                RefreshStateFromService(false);
-                StartLicensePolling();
-            });
+                RunOnUiThread([this]
+                {
+                    RefreshStateFromService(false);
+                    StartLicensePolling();
+                });
+            }
             return;
         }
 
@@ -1246,8 +1430,6 @@ namespace winrt::ZIVPO::implementation
             m_mainWindowVisible = false;
             return;
         }
-
-        EnsureMainWindowHooked();
 
         RECT windowRect{};
         if (GetWindowRect(hwnd, &windowRect))
@@ -1274,11 +1456,14 @@ namespace winrt::ZIVPO::implementation
         TraceMessage(L"ShowMainWindow: native window shown and focused");
 
         // Refresh service-backed UI state only after window is shown and UI is active.
-        RunOnUiThread([this]
+        if (!IsEnvironmentFlagEnabled(L"ZIVPO_SKIP_STARTUP_REFRESH"))
         {
-            RefreshStateFromService(false);
-            StartLicensePolling();
-        });
+            RunOnUiThread([this]
+            {
+                RefreshStateFromService(false);
+                StartLicensePolling();
+            });
+        }
         TraceMessage(L"ShowMainWindow end");
     }
 
@@ -1331,38 +1516,5 @@ namespace winrt::ZIVPO::implementation
 
         ::ZIVPO::Service::RequestServiceStop();
         ExitApplication();
-    }
-
-    LRESULT CALLBACK App::MainWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
-    {
-        auto* self = reinterpret_cast<App*>(GetPropW(hwnd, kAppInstancePropertyName));
-        if (self == nullptr)
-        {
-            return DefWindowProcW(hwnd, message, wParam, lParam);
-        }
-
-        return self->HandleMainWindowMessage(hwnd, message, wParam, lParam);
-    }
-
-    LRESULT App::HandleMainWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
-    {
-        if (message == WM_CLOSE && !m_isExiting)
-        {
-            HideMainWindow();
-            return 0;
-        }
-
-        if (message == WM_COMMAND && LOWORD(wParam) == kMainMenuExitId)
-        {
-            StopServiceAndExitApplication();
-            return 0;
-        }
-
-        if (m_originalMainWindowProc != nullptr)
-        {
-            return CallWindowProcW(m_originalMainWindowProc, hwnd, message, wParam, lParam);
-        }
-
-        return DefWindowProcW(hwnd, message, wParam, lParam);
     }
 }
